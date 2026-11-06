@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Shotcut with native DJI Osmo 360 (.OSV) support
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+export MLT_REPOSITORY="${SCRIPT_DIR}/build/plugins"
+export MLT_DATA="${SCRIPT_DIR}/build/share/mlt-7"
+
+echo "[Shotcut-OSV] Initializing with MLT_REPOSITORY=${MLT_REPOSITORY}"
+exec /usr/bin/shotcut "$@"

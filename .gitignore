@@ -1,0 +1,20 @@
+# Build artifacts
+build/
+bin/build/
+*.o
+*.a
+*.so
+*.spv
+
+# Large test files and renders
+*.ppm
+*.mp4
+test_out*
+melt_stitched*
+*.jpg
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*~
