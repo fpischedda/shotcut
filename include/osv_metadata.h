@@ -17,11 +17,19 @@ struct LensCalibration {
     float quat[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // x, y, z, w
 };
 
+enum class OsvStabilizationMode {
+    Off = 0,
+    HorizonLock = 1,
+    FullLock = 2
+};
+
 struct OsvTelemetryFrame {
     int64_t timestamp_us = 0;
-    float gyro_quat[4] = {0.0f, 0.0f, 0.0f, 1.0f}; // x, y, z, w
-    float gyro_rad_s[3] = {0.0f, 0.0f, 0.0f};     // wx, wy, wz
-    float accel_g[3] = {0.0f, 0.0f, 0.0f};        // ax, ay, az
+    float raw_quat[4] = {0.0f, 0.0f, 0.0f, 1.0f};     // Stored floats f0, f1, f2, f3
+    float gyro_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};    // w, x, y, z (body to world)
+    float horizon_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // w, x, y, z (horizon leveling)
+    float gyro_rad_s[3] = {0.0f, 0.0f, 0.0f};       // wx, wy, wz
+    float accel_g[3] = {0.0f, 0.0f, 0.0f};          // ax, ay, az
 };
 
 struct OsvMetadata {
@@ -37,6 +45,8 @@ struct OsvMetadata {
     LensCalibration lens_rear;
 
     std::vector<OsvTelemetryFrame> telemetry_frames;
+
+    void getStabilizationQuat(int64_t frame_idx, int mode, float out_quat[4]) const;
 };
 
 class OsvMetadataParser {

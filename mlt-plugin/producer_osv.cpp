@@ -33,6 +33,7 @@ struct ProducerOsvContext {
     int cached_w = 0;
     int cached_h = 0;
     bool cached_export_mode = false;
+    int cached_stab_mode = -1;
     std::vector<uint8_t> cached_equirect;
 
     mlt_position last_position = -1;
@@ -111,9 +112,22 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     ProducerOsvContext* ctx = (ProducerOsvContext*)producer->child;
 
     mlt_position position = mlt_frame_get_position(frame);
-    mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
+
+    // Gyro stabilization mode: 0 = Off, 1 = Horizon Lock (default), 2 = Full Lock
+    mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
+    int stab_mode = 1;
+    const char* stab_str = mlt_properties_get(props, "osv.stabilization");
+    if (stab_str) {
+        if (std::strcmp(stab_str, "0") == 0 || std::strcmp(stab_str, "off") == 0 || std::strcmp(stab_str, "Off") == 0) {
+            stab_mode = 0;
+        } else if (std::strcmp(stab_str, "2") == 0 || std::strcmp(stab_str, "full") == 0 || std::strcmp(stab_str, "Full") == 0) {
+            stab_mode = 2;
+        } else {
+            stab_mode = 1;
+        }
+    }
 
     // Fast-path: Companion .LRF proxy decoding during interactive editor playback
     // The camera's companion .LRF is 2048x1024 progressive H.264 side-by-side dual fisheye.
@@ -123,6 +137,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     // Instantaneous cache hit when user pans/rotates/zooms the 360 viewport on the same frame
     if (position == ctx->cached_position && export_mode == ctx->cached_export_mode &&
+        stab_mode == ctx->cached_stab_mode &&
         ctx->cached_w > 0 && ctx->cached_h > 0 &&
         ctx->cached_equirect.size() == (size_t)ctx->cached_w * ctx->cached_h * 4) {
         *width = ctx->cached_w;
@@ -162,13 +177,14 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
                 int buf_size = out_w * out_h * 4;
                 *image = (uint8_t*)mlt_pool_alloc(buf_size);
 
-                float default_gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
+                float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+                ctx->metadata.getStabilizationQuat(position, stab_mode, gyro);
                 bool ok = ctx->stitcher->stitchSideBySide(
                     lrf_img,
                     lw, lh,
                     ctx->metadata.lens_rear,  // Master (Stream 1)
                     ctx->metadata.lens_front, // Slave (Stream 0)
-                    default_gyro,
+                    gyro,
                     out_w, out_h,
                     *image
                 );
@@ -180,6 +196,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
                     ctx->cached_w = out_w;
                     ctx->cached_h = out_h;
                     ctx->cached_export_mode = export_mode;
+                    ctx->cached_stab_mode = stab_mode;
                     ctx->cached_equirect.assign(*image, *image + buf_size);
 
                     mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
@@ -259,13 +276,14 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     *image = (uint8_t*)mlt_pool_alloc(buf_size);
 
     if (img_master && img_slave && ctx->stitcher_initialized) {
-        float default_gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
+        float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+        ctx->metadata.getStabilizationQuat(position, stab_mode, gyro);
         if (ctx->stitcher->stitchFrames(
             img_master, img_slave,
             w1, h1,
             ctx->metadata.lens_rear,  // Master (Lens 2)
             ctx->metadata.lens_front, // Slave (Lens 1)
-            default_gyro,
+            gyro,
             out_w, out_h,
             *image
         )) {
@@ -273,6 +291,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
             ctx->cached_w = out_w;
             ctx->cached_h = out_h;
             ctx->cached_export_mode = export_mode;
+            ctx->cached_stab_mode = stab_mode;
             ctx->cached_equirect.assign(*image, *image + buf_size);
         }
     } else {
@@ -323,15 +342,15 @@ static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int in
 static void producer_close(mlt_producer producer) {
     if (producer && producer->child) {
         ProducerOsvContext* ctx = (ProducerOsvContext*)producer->child;
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        producer->child = nullptr;
         if (ctx->producer_master) mlt_producer_close(ctx->producer_master);
         if (ctx->producer_slave) mlt_producer_close(ctx->producer_slave);
         if (ctx->producer_audio) mlt_producer_close(ctx->producer_audio);
         if (ctx->producer_lrf) mlt_producer_close(ctx->producer_lrf);
         delete ctx;
-        producer->child = nullptr;
     }
     producer->close = nullptr;
-    mlt_producer_close(producer);
 }
 
 extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type type, const char* id, const char* filename) {
@@ -395,11 +414,16 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set(props, "meta.media.1.codec.sample_rate", "48000");
     mlt_properties_set(props, "meta.media.1.codec.sample_fmt", "fltp");
 
-    // Parse OSV metadata
+    // Parse OSV metadata and per-frame attitude telemetry
     if (filename && OsvMetadataParser::parseFromFile(filename, ctx->metadata)) {
         mlt_properties_set(props, "meta.camera.model", ctx->metadata.camera_model.c_str());
         mlt_properties_set(props, "meta.camera.serial", ctx->metadata.serial_number.c_str());
+        mlt_properties_set_int(props, "meta.telemetry.samples", ctx->metadata.telemetry_frames.size());
     }
+
+    // Default stabilization: 1 = Horizon Lock (0 = Off, 1 = Horizon Lock, 2 = Full Lock)
+    mlt_properties_set_int(props, "osv.stabilization", 1);
+    mlt_properties_set(props, "meta.stabilization.mode", "Horizon Lock (1)");
 
     // Check for companion .LRF proxy file (e.g. CAM_..._D.LRF)
     if (filename) {

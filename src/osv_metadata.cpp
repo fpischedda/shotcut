@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include <cstring>
+#include <cmath>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -83,7 +84,220 @@ void parseLensMessage(const uint8_t* data, size_t size, LensCalibration& lens) {
     }
 }
 
+// Compute horizon lock correction quaternion:
+// Given body->world quaternion b2w = (w, x, y, z),
+// produces gyro quaternion in (w, x, y, z) that levels true gravity vertical (+Z)
+// to equirectangular vertical (0, 0, 1) while preserving camera heading.
+void computeHorizonLock(const float b2w[4], float out[4]) {
+    // Conjugate of b2w maps world -> body:
+    float qw = b2w[0], qx = -b2w[1], qy = -b2w[2], qz = -b2w[3];
+
+    // Body ray pointing to world vertical (0, 0, 1): up_b = R(qw, qx, qy, qz) * (0, 0, 1)
+    float uv_x = qy * 1.0f;
+    float uv_y = -qx * 1.0f;
+    float uv_z = 0.0f;
+
+    float uuv_x = qy * uv_z - qz * uv_y;
+    float uuv_y = qz * uv_x - qx * uv_z;
+    float uuv_z = qx * uv_y - qy * uv_x;
+
+    float up_bx = (uv_x * qw + uuv_x) * 2.0f;
+    float up_by = (uv_y * qw + uuv_y) * 2.0f;
+    float up_bz = 1.0f + (uv_z * qw + uuv_z) * 2.0f;
+
+    float up_len = std::sqrt(up_bx * up_bx + up_by * up_by + up_bz * up_bz);
+    if (up_len > 1e-6f) {
+        up_bx /= up_len; up_by /= up_len; up_bz /= up_len;
+    } else {
+        up_bx = 0.0f; up_by = 0.0f; up_bz = 1.0f;
+    }
+
+    // Camera body forward is (0, 1, 0).
+    // Project camera forward onto plane perpendicular to up_b:
+    float dot = up_by;
+    float fwd_bx = -up_bx * dot;
+    float fwd_by = 1.0f - up_by * dot;
+    float fwd_bz = -up_bz * dot;
+
+    float fwd_len = std::sqrt(fwd_bx * fwd_bx + fwd_by * fwd_by + fwd_bz * fwd_bz);
+    if (fwd_len > 1e-6f) {
+        fwd_bx /= fwd_len; fwd_by /= fwd_len; fwd_bz /= fwd_len;
+    } else {
+        fwd_bx = 0.0f; fwd_by = 1.0f; fwd_bz = 0.0f;
+    }
+
+    // right_b = fwd_b x up_b
+    float right_bx = fwd_by * up_bz - fwd_bz * up_by;
+    float right_by = fwd_bz * up_bx - fwd_bx * up_bz;
+    float right_bz = fwd_bx * up_by - fwd_by * up_bx;
+
+    // Basis matrix M = [right_b, fwd_b, up_b] converts equirect ray to body ray (invGyro).
+    float m00 = right_bx, m01 = fwd_bx, m02 = up_bx;
+    float m10 = right_by, m11 = fwd_by, m12 = up_by;
+    float m20 = right_bz, m21 = fwd_bz, m22 = up_bz;
+
+    float trace = m00 + m11 + m22;
+    float q_e2b_w, q_e2b_x, q_e2b_y, q_e2b_z;
+    if (trace > 0.0f) {
+        float s = 0.5f / std::sqrt(trace + 1.0f);
+        q_e2b_w = 0.25f / s;
+        q_e2b_x = (m21 - m12) * s;
+        q_e2b_y = (m02 - m20) * s;
+        q_e2b_z = (m10 - m01) * s;
+    } else if (m00 > m11 && m00 > m22) {
+        float s = 2.0f * std::sqrt(1.0f + m00 - m11 - m22);
+        q_e2b_w = (m21 - m12) / s;
+        q_e2b_x = 0.25f * s;
+        q_e2b_y = (m01 + m10) / s;
+        q_e2b_z = (m02 + m20) / s;
+    } else if (m11 > m22) {
+        float s = 2.0f * std::sqrt(1.0f + m11 - m00 - m22);
+        q_e2b_w = (m02 - m20) / s;
+        q_e2b_x = (m01 + m10) / s;
+        q_e2b_y = 0.25f * s;
+        q_e2b_z = (m12 + m21) / s;
+    } else {
+        float s = 2.0f * std::sqrt(1.0f + m22 - m00 - m11);
+        q_e2b_w = (m10 - m01) / s;
+        q_e2b_x = (m02 + m20) / s;
+        q_e2b_y = (m12 + m21) / s;
+        q_e2b_z = 0.25f * s;
+    }
+
+    // Since in shader dBody = quatRotate(invGyro, dEquirect),
+    // and invGyro is q_e2b, gyro is conjugate of q_e2b:
+    out[0] = q_e2b_w;
+    out[1] = -q_e2b_x;
+    out[2] = -q_e2b_y;
+    out[3] = -q_e2b_z;
+}
+
+void parseFrameMeta(const uint8_t* data, size_t size, OsvMetadata& out_meta) {
+    const uint8_t* ptr = data;
+    const uint8_t* end = data + size;
+
+    OsvTelemetryFrame frame;
+    bool has_attitude = false;
+
+    while (ptr < end) {
+        uint64_t tag = readVarint(ptr, end);
+        uint32_t fn = tag >> 3;
+        uint32_t wt = tag & 0x7;
+
+        if (wt != 2) {
+            if (wt == 0) readVarint(ptr, end);
+            else if (wt == 1) ptr += 8;
+            else if (wt == 5) ptr += 4;
+            continue;
+        }
+
+        uint64_t len = readVarint(ptr, end);
+        if (ptr + len > end) break;
+
+        if (fn == 1) { // FrameMetaHeader
+            const uint8_t* h_ptr = ptr;
+            const uint8_t* h_end = ptr + len;
+            while (h_ptr < h_end) {
+                uint64_t ht = readVarint(h_ptr, h_end);
+                uint32_t hfn = ht >> 3;
+                uint32_t hwt = ht & 0x7;
+                if (hwt == 0) {
+                    uint64_t v = readVarint(h_ptr, h_end);
+                    if (hfn == 2) frame.timestamp_us = static_cast<int64_t>(v);
+                } else if (hwt == 1) h_ptr += 8;
+                else if (hwt == 5) h_ptr += 4;
+                else if (hwt == 2) {
+                    uint64_t hl = readVarint(h_ptr, h_end);
+                    h_ptr += hl;
+                }
+            }
+        } else if (fn == 2) { // FrameMetaOfCamera
+            const uint8_t* c_ptr = ptr;
+            const uint8_t* c_end = ptr + len;
+            while (c_ptr < c_end) {
+                uint64_t ct = readVarint(c_ptr, c_end);
+                uint32_t cfn = ct >> 3;
+                uint32_t cwt = ct & 0x7;
+                if (cwt == 2) {
+                    uint64_t cl = readVarint(c_ptr, c_end);
+                    if (cfn == 9) { // camera_attitude (Quaternion)
+                        const uint8_t* q_ptr = c_ptr;
+                        const uint8_t* q_end = c_ptr + cl;
+                        float f[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+                        while (q_ptr < q_end) {
+                            uint64_t qt = readVarint(q_ptr, q_end);
+                            uint32_t qfn = qt >> 3;
+                            uint32_t qwt = qt & 0x7;
+                            if (qwt == 5) {
+                                float val = readFloat(q_ptr, q_end);
+                                if (qfn >= 1 && qfn <= 4) f[qfn - 1] = val;
+                            } else if (qwt == 0) readVarint(q_ptr, q_end);
+                            else if (qwt == 1) q_ptr += 8;
+                            else if (qwt == 2) {
+                                uint64_t ql = readVarint(q_ptr, q_end);
+                                q_ptr += ql;
+                            }
+                        }
+                        frame.raw_quat[0] = f[0];
+                        frame.raw_quat[1] = f[1];
+                        frame.raw_quat[2] = f[2];
+                        frame.raw_quat[3] = f[3];
+
+                        // OpenOSV body -> world quaternion convention:
+                        // q' = (w = f3; x = -f1, y = f2, z = f0)
+                        float b2w[4] = {f[3], -f[1], f[2], f[0]};
+                        float norm = std::sqrt(b2w[0]*b2w[0] + b2w[1]*b2w[1] + b2w[2]*b2w[2] + b2w[3]*b2w[3]);
+                        if (norm > 1e-6f) {
+                            b2w[0] /= norm; b2w[1] /= norm; b2w[2] /= norm; b2w[3] /= norm;
+                        } else {
+                            b2w[0] = 1.0f; b2w[1] = 0.0f; b2w[2] = 0.0f; b2w[3] = 0.0f;
+                        }
+                        std::memcpy(frame.gyro_quat, b2w, 4 * sizeof(float));
+
+                        computeHorizonLock(b2w, frame.horizon_quat);
+                        has_attitude = true;
+                    }
+                    c_ptr += cl;
+                } else if (cwt == 0) readVarint(c_ptr, c_end);
+                else if (cwt == 1) c_ptr += 8;
+                else if (cwt == 5) c_ptr += 4;
+            }
+        }
+        ptr += len;
+    }
+
+    if (has_attitude) {
+        out_meta.telemetry_frames.push_back(frame);
+    }
+}
+
 } // namespace
+
+void OsvMetadata::getStabilizationQuat(int64_t frame_idx, int mode, float out_quat[4]) const {
+    if (mode == static_cast<int>(OsvStabilizationMode::Off) || telemetry_frames.empty()) {
+        out_quat[0] = 1.0f;
+        out_quat[1] = 0.0f;
+        out_quat[2] = 0.0f;
+        out_quat[3] = 0.0f;
+        return;
+    }
+
+    size_t idx = 0;
+    if (frame_idx < 0) {
+        idx = 0;
+    } else if (static_cast<size_t>(frame_idx) >= telemetry_frames.size()) {
+        idx = telemetry_frames.size() - 1;
+    } else {
+        idx = static_cast<size_t>(frame_idx);
+    }
+
+    const auto& tf = telemetry_frames[idx];
+    if (mode == static_cast<int>(OsvStabilizationMode::FullLock)) {
+        std::memcpy(out_quat, tf.gyro_quat, 4 * sizeof(float));
+    } else { // HorizonLock (default)
+        std::memcpy(out_quat, tf.horizon_quat, 4 * sizeof(float));
+    }
+}
 
 bool OsvMetadataParser::parseFromBuffer(const uint8_t* data, size_t size, OsvMetadata& out_meta) {
     const uint8_t* ptr = data;
@@ -182,6 +396,9 @@ bool OsvMetadataParser::parseFromBuffer(const uint8_t* data, size_t size, OsvMet
                 else if (v_wire == 5) v_ptr += 4;
                 else if (v_wire == 1) v_ptr += 8;
             }
+        } else if (field_num == 3) {
+            // FrameMeta: timestamp, attitude, imu
+            parseFrameMeta(msg_start, len, out_meta);
         }
 
         ptr += len;
@@ -218,14 +435,13 @@ bool OsvMetadataParser::parseFromFile(const std::string& osv_path, OsvMetadata& 
     }
 
     AVPacket* pkt = av_packet_alloc();
-    bool parsed = false;
+    bool parsed_header = false;
 
-    // Read the first few packets containing the header and calibration
+    // Read all packets in the metadata stream to extract calibration and per-frame telemetry
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         if (pkt->stream_index == djmd_stream_idx) {
             if (parseFromBuffer(pkt->data, pkt->size, out_meta)) {
-                parsed = true;
-                break;
+                parsed_header = true;
             }
         }
         av_packet_unref(pkt);
@@ -233,5 +449,5 @@ bool OsvMetadataParser::parseFromFile(const std::string& osv_path, OsvMetadata& 
 
     av_packet_free(&pkt);
     avformat_close_input(&fmt_ctx);
-    return parsed;
+    return parsed_header;
 }

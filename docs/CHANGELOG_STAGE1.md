@@ -140,3 +140,19 @@ In this development milestone, we implemented full native support for **DJI Osmo
   - Pure rectilinear projection uses vectorized incremental ray math with AVX2 and FMA.
   - Multi-threaded OpenMP execution delivers **~138 FPS** sequential playback and **~185 FPS** during active viewport manipulation.
 
+### 8. Native Gyro Horizon Lock & Stabilization
+- **Synchronous Telemetry Extraction**:
+  - Parsed Google Protocol Buffers timed metadata stream (`djmd`, Stream 3) across the container.
+  - Extracted per-frame fused `camera_attitude` quaternions into `OsvMetadata::telemetry_frames`.
+  - Derived body-to-world gravity alignment $\mathbf{q}_{\text{body}\to\text{world}} = (w = f_3; x = -f_1, y = f_2, z = f_0)$.
+- **Analytical Horizon Lock Decoupling**:
+  - Developed mathematical decoupling that maps physical gravity vertical to the equirectangular zenith while preserving the camera's horizontal heading (yaw).
+  - Precomputes orthonormal basis and quaternion rotation in $O(1)$ time with zero runtime trigonometric overhead.
+- **Vulkan Shader Push Constant Integration**:
+  - Injected real-time stabilization quaternion `pc.gyro_quat` into `shaders/osv_stitch.comp`.
+  - Unified stabilization for both fast `.LRF` proxy preview editing and full 4K dual-HEVC final export.
+- **Shotcut User Controls**:
+  - Exposed `osv.stabilization` property on the producer (`0 = Off`, `1 = Horizon Lock [default]`, `2 = Full Lock`).
+  - Integrated cache invalidation on stabilization mode switch.
+
+
