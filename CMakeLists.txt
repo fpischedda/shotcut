@@ -81,3 +81,28 @@ set_target_properties(mltosv PROPERTIES
     PREFIX "lib"
     OUTPUT_NAME "mltosv"
 )
+
+# High-Performance Frei0r Bigsh0t Equirectangular to Rectilinear Filter
+find_package(OpenMP REQUIRED)
+
+add_library(bigsh0t_eq_to_rect MODULE
+    src/bigsh0t_eq_to_rect.cpp
+)
+
+target_link_libraries(bigsh0t_eq_to_rect PRIVATE
+    OpenMP::OpenMP_CXX
+)
+
+target_compile_options(bigsh0t_eq_to_rect PRIVATE
+    -O3
+    -ffast-math
+    -mavx2
+    -mfma
+)
+
+set_target_properties(bigsh0t_eq_to_rect PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "bigsh0t_eq_to_rect"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/plugins/frei0r"
+)
+

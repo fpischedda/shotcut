@@ -4,6 +4,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 export MLT_REPOSITORY="${SCRIPT_DIR}/build/plugins"
 export MLT_DATA="${SCRIPT_DIR}/build/share/mlt-7"
+export FREI0R_PATH="${SCRIPT_DIR}/build/plugins/frei0r:/usr/lib/frei0r-1:/usr/lib64/frei0r-1"
 
 echo "[Shotcut-OSV] Initializing with MLT_REPOSITORY=${MLT_REPOSITORY}"
 exec /usr/bin/shotcut "$@"

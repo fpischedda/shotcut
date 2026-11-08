@@ -4,12 +4,19 @@
 #include <cstring>
 #include <stdexcept>
 
-static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties) {
+static uint32_t findMemoryType(VkPhysicalDevice physicalDevice, uint32_t typeFilter, VkMemoryPropertyFlags properties, bool allowFallback = false, VkMemoryPropertyFlags fallbackProperties = 0) {
     VkPhysicalDeviceMemoryProperties memProperties;
     vkGetPhysicalDeviceMemoryProperties(physicalDevice, &memProperties);
     for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
         if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & properties) == properties) {
             return i;
+        }
+    }
+    if (allowFallback) {
+        for (uint32_t i = 0; i < memProperties.memoryTypeCount; i++) {
+            if ((typeFilter & (1 << i)) && (memProperties.memoryTypes[i].propertyFlags & fallbackProperties) == fallbackProperties) {
+                return i;
+            }
         }
     }
     throw std::runtime_error("failed to find suitable memory type!");
@@ -331,7 +338,7 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w, uint32_t sensor_h, ui
     size_t inBytes = sensor_w * sensor_h * 4;
     size_t outBytes = out_w * out_h * 4;
 
-    auto createBuf = [&](size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, VkBuffer& buf, VkDeviceMemory& mem) {
+    auto createBuf = [&](size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags props, VkBuffer& buf, VkDeviceMemory& mem, bool allowFallback = false, VkMemoryPropertyFlags fallbackProps = 0) {
         VkBufferCreateInfo bInfo{};
         bInfo.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
         bInfo.size = size;
@@ -344,14 +351,18 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w, uint32_t sensor_h, ui
         VkMemoryAllocateInfo allocInfo{};
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
         allocInfo.allocationSize = req.size;
-        allocInfo.memoryTypeIndex = findMemoryType(physical_device_, req.memoryTypeBits, props);
+        allocInfo.memoryTypeIndex = findMemoryType(physical_device_, req.memoryTypeBits, props, allowFallback, fallbackProps);
         vkAllocateMemory(device_, &allocInfo, nullptr, &mem);
         vkBindBufferMemory(device_, buf, mem, 0);
     };
 
     createBuf(inBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stageInMaster_, stageInMasterMem_);
     createBuf(inBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stageInSlave_, stageInSlaveMem_);
-    createBuf(outBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, stageOut_, stageOutMem_);
+    // Prefer HOST_CACHED memory for GPU->CPU readback to avoid 45ms uncached write-combining read stalls on Intel/AMD GPUs
+    createBuf(outBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_CACHED_BIT,
+              stageOut_, stageOutMem_, true,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
 
     vkMapMemory(device_, stageInMasterMem_, 0, inBytes, 0, &mappedInMaster_);
     vkMapMemory(device_, stageInSlaveMem_, 0, inBytes, 0, &mappedInSlave_);
@@ -500,10 +511,54 @@ bool OsvVulkanStitcher::stitchFrames(
     }
 
     size_t inBytes = sensor_w * sensor_h * 4;
-    size_t outBytes = out_w * out_h * 4;
-
     std::memcpy(mappedInMaster_, master_rgba, inBytes);
     std::memcpy(mappedInSlave_, slave_rgba, inBytes);
+
+    return executeStitchPass(sensor_w, sensor_h, lens_master, lens_slave, gyro_quat, out_w, out_h, out_equirect_rgba);
+}
+
+bool OsvVulkanStitcher::stitchSideBySide(
+    const uint8_t* sbs_rgba,
+    uint32_t sbs_w,
+    uint32_t sbs_h,
+    const LensCalibration& lens_master,
+    const LensCalibration& lens_slave,
+    const float* gyro_quat,
+    uint32_t out_w,
+    uint32_t out_h,
+    uint8_t* out_equirect_rgba
+) {
+    uint32_t eye_w = sbs_w / 2;
+    uint32_t eye_h = sbs_h;
+    if (!ensureResources(eye_w, eye_h, out_w, out_h)) {
+        return false;
+    }
+
+    size_t row_bytes = (size_t)eye_w * 4;
+    size_t sbs_stride = (size_t)sbs_w * 4;
+    uint8_t* dst_slave = static_cast<uint8_t*>(mappedInSlave_);
+    uint8_t* dst_master = static_cast<uint8_t*>(mappedInMaster_);
+
+    for (uint32_t y = 0; y < eye_h; ++y) {
+        const uint8_t* src_row = sbs_rgba + (size_t)y * sbs_stride;
+        std::memcpy(dst_slave + (size_t)y * row_bytes, src_row, row_bytes);
+        std::memcpy(dst_master + (size_t)y * row_bytes, src_row + row_bytes, row_bytes);
+    }
+
+    return executeStitchPass(eye_w, eye_h, lens_master, lens_slave, gyro_quat, out_w, out_h, out_equirect_rgba);
+}
+
+bool OsvVulkanStitcher::executeStitchPass(
+    uint32_t sensor_w,
+    uint32_t sensor_h,
+    const LensCalibration& lens_master,
+    const LensCalibration& lens_slave,
+    const float* gyro_quat,
+    uint32_t out_w,
+    uint32_t out_h,
+    uint8_t* out_equirect_rgba
+) {
+    size_t outBytes = out_w * out_h * 4;
 
     vkResetCommandBuffer(cmd_, 0);
 
@@ -597,6 +652,13 @@ bool OsvVulkanStitcher::stitchFrames(
 
     vkQueueSubmit(compute_queue_, 1, &submitInfo, fence_);
     vkWaitForFences(device_, 1, &fence_, VK_TRUE, UINT64_MAX);
+
+    VkMappedMemoryRange mappedRange{};
+    mappedRange.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+    mappedRange.memory = stageOutMem_;
+    mappedRange.offset = 0;
+    mappedRange.size = VK_WHOLE_SIZE;
+    vkInvalidateMappedMemoryRanges(device_, 1, &mappedRange);
 
     std::memcpy(out_equirect_rgba, mappedOut_, outBytes);
     return true;

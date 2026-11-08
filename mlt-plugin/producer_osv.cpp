@@ -10,15 +10,17 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <filesystem>
+#include <mutex>
 
 struct ProducerOsvContext {
     mlt_profile profile = nullptr;
     std::string osv_path;
+    std::mutex mutex;
 
     mlt_producer producer_slave = nullptr;  // Stream 0: Slave lens (Rear)
     mlt_producer producer_master = nullptr; // Stream 1: Master lens (Front)
     mlt_producer producer_audio = nullptr;  // Stream 2: Audio
-    mlt_producer producer_lrf = nullptr;    // Companion .LRF pre-stitched proxy
+    mlt_producer producer_lrf = nullptr;    // Companion .LRF side-by-side dual-fisheye proxy
 
     OsvMetadata metadata;
     std::unique_ptr<OsvVulkanStitcher> stitcher;
@@ -26,8 +28,12 @@ struct ProducerOsvContext {
     bool has_lrf = false;
     std::string lrf_path;
 
-    std::vector<uint8_t> lrf_slave;
-    std::vector<uint8_t> lrf_master;
+    // Stitched frame cache to make interactive viewport pan/tilt/zoom at a paused position instantaneous
+    mlt_position cached_position = -1;
+    int cached_w = 0;
+    int cached_h = 0;
+    bool cached_export_mode = false;
+    std::vector<uint8_t> cached_equirect;
 
     mlt_position last_position = -1;
     mlt_position last_lrf_position = -1;
@@ -107,11 +113,27 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     mlt_position position = mlt_frame_get_position(frame);
     mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
 
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+
     // Fast-path: Companion .LRF proxy decoding during interactive editor playback
     // The camera's companion .LRF is 2048x1024 progressive H.264 side-by-side dual fisheye.
     // Left half (1024x1024) is Slave lens (Stream 0), Right half (1024x1024) is Master lens (Stream 1).
     bool export_mode = is_render_export(producer);
     bool use_lrf = ctx->has_lrf && ctx->producer_lrf && !export_mode;
+
+    // Instantaneous cache hit when user pans/rotates/zooms the 360 viewport on the same frame
+    if (position == ctx->cached_position && export_mode == ctx->cached_export_mode &&
+        ctx->cached_w > 0 && ctx->cached_h > 0 &&
+        ctx->cached_equirect.size() == (size_t)ctx->cached_w * ctx->cached_h * 4) {
+        *width = ctx->cached_w;
+        *height = ctx->cached_h;
+        *format = mlt_image_rgba;
+        int buf_size = ctx->cached_w * ctx->cached_h * 4;
+        *image = (uint8_t*)mlt_pool_alloc(buf_size);
+        std::memcpy(*image, ctx->cached_equirect.data(), buf_size);
+        mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
+        return 0;
+    }
 
     if (use_lrf) {
         if (!ctx->ensureStitcher()) {
@@ -132,19 +154,6 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
             int lw = 2048;
             int lh = 1024;
             if (mlt_frame_get_image(lrf_frame, &lrf_img, &fmt, &lw, &lh, 0) == 0 && lrf_img) {
-                if (ctx->lrf_slave.size() != 1024 * 1024 * 4) {
-                    ctx->lrf_slave.resize(1024 * 1024 * 4);
-                    ctx->lrf_master.resize(1024 * 1024 * 4);
-                }
-
-                // De-interleave 2048x1024 side-by-side proxy into two 1024x1024 lens buffers
-                // Left half is Slave (Stream 0 / Rear), Right half is Master (Stream 1 / Front)
-                for (int y = 0; y < 1024; ++y) {
-                    const uint8_t* row = lrf_img + y * 2048 * 4;
-                    std::memcpy(ctx->lrf_slave.data() + y * 1024 * 4, row, 1024 * 4);
-                    std::memcpy(ctx->lrf_master.data() + y * 1024 * 4, row + 1024 * 4, 1024 * 4);
-                }
-
                 int out_w = 2048;
                 int out_h = 1024;
                 *width = out_w;
@@ -154,10 +163,9 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
                 *image = (uint8_t*)mlt_pool_alloc(buf_size);
 
                 float default_gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
-                bool ok = ctx->stitcher->stitchFrames(
-                    ctx->lrf_master.data(),
-                    ctx->lrf_slave.data(),
-                    1024, 1024,
+                bool ok = ctx->stitcher->stitchSideBySide(
+                    lrf_img,
+                    lw, lh,
                     ctx->metadata.lens_rear,  // Master (Stream 1)
                     ctx->metadata.lens_front, // Slave (Stream 0)
                     default_gyro,
@@ -168,6 +176,12 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
                 mlt_frame_close(lrf_frame);
 
                 if (ok) {
+                    ctx->cached_position = position;
+                    ctx->cached_w = out_w;
+                    ctx->cached_h = out_h;
+                    ctx->cached_export_mode = export_mode;
+                    ctx->cached_equirect.assign(*image, *image + buf_size);
+
                     mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
                     return 0;
                 } else {
@@ -246,7 +260,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     if (img_master && img_slave && ctx->stitcher_initialized) {
         float default_gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
-        ctx->stitcher->stitchFrames(
+        if (ctx->stitcher->stitchFrames(
             img_master, img_slave,
             w1, h1,
             ctx->metadata.lens_rear,  // Master (Lens 2)
@@ -254,7 +268,13 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
             default_gyro,
             out_w, out_h,
             *image
-        );
+        )) {
+            ctx->cached_position = position;
+            ctx->cached_w = out_w;
+            ctx->cached_h = out_h;
+            ctx->cached_export_mode = export_mode;
+            ctx->cached_equirect.assign(*image, *image + buf_size);
+        }
     } else {
         std::memset(*image, 0, buf_size);
     }
@@ -434,7 +454,7 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     if (mlt_properties_get_int(props, "reframe") == 1) {
         mlt_filter reframe_filter = mlt_factory_filter(profile, "frei0r.bigsh0t_eq_to_rect", nullptr);
         if (reframe_filter) {
-            mlt_properties_set_double(MLT_FILTER_PROPERTIES(reframe_filter), "fov", 0.28); // ~90 degrees
+            mlt_properties_set_double(MLT_FILTER_PROPERTIES(reframe_filter), "fov", 90.0); // 90 degrees
             mlt_service_attach(MLT_PRODUCER_SERVICE(producer), reframe_filter);
         }
     }

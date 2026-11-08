@@ -41,6 +41,18 @@ public:
         uint8_t* out_equirect_rgba
     );
 
+    bool stitchSideBySide(
+        const uint8_t* sbs_rgba,
+        uint32_t sbs_w,
+        uint32_t sbs_h,
+        const LensCalibration& lens_master,
+        const LensCalibration& lens_slave,
+        const float* gyro_quat,
+        uint32_t out_w,
+        uint32_t out_h,
+        uint8_t* out_equirect_rgba
+    );
+
 private:
     VkInstance instance_ = VK_NULL_HANDLE;
     VkPhysicalDevice physical_device_ = VK_NULL_HANDLE;
@@ -89,6 +101,16 @@ private:
     bool initVulkanCore();
     bool createPipeline(const std::string& spv_path);
     bool ensureResources(uint32_t sensor_w, uint32_t sensor_h, uint32_t out_w, uint32_t out_h);
+    bool executeStitchPass(
+        uint32_t sensor_w,
+        uint32_t sensor_h,
+        const LensCalibration& lens_master,
+        const LensCalibration& lens_slave,
+        const float* gyro_quat,
+        uint32_t out_w,
+        uint32_t out_h,
+        uint8_t* out_equirect_rgba
+    );
     void freeResources();
 };
 
