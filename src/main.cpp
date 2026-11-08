@@ -1,9 +1,5 @@
 #include "osv_metadata.h"
 #include "osv_vulkan.h"
-#include <iostream>
-#include <vector>
-#include <fstream>
-#include <cstring>
 
 extern "C" {
 #include <libavformat/avformat.h>
@@ -12,49 +8,60 @@ extern "C" {
 #include <libavutil/imgutils.h>
 }
 
-// Simple PPM image writer (no external dependency needed)
-void writePPM(const std::string& filename, int width, int height, const uint8_t* rgba) {
-    std::ofstream out(filename, std::ios::binary);
-    out << "P6\n" << width << " " << height << "\n255\n";
-    for (int i = 0; i < width * height; ++i) {
-        out.put(rgba[i * 4 + 0]); // R
-        out.put(rgba[i * 4 + 1]); // G
-        out.put(rgba[i * 4 + 2]); // B
+#include <iostream>
+#include <vector>
+#include <fstream>
+#include <cstring>
+
+static void writePPM(const std::string& path, int width, int height, const uint8_t* rgba) {
+    std::ofstream ofs(path, std::ios::binary);
+    ofs << "P6\n" << width << " " << height << "\n255\n";
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const uint8_t* p = &rgba[(y * width + x) * 4];
+            ofs.put(p[0]); // R
+            ofs.put(p[1]); // G
+            ofs.put(p[2]); // B
+        }
     }
-    out.close();
-    std::cout << "[OSV] Saved stitched frame to: " << filename << std::endl;
+    std::cout << "[OSV] Saved stitched frame to: " << path << std::endl;
 }
 
-bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, int64_t target_ts_us, std::vector<uint8_t>& out_rgba, int& width, int& height) {
-    AVCodecParameters* codecpar = fmt_ctx->streams[stream_idx]->codecpar;
-    const AVCodec* codec = avcodec_find_decoder(codecpar->codec_id);
+static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, int frame_target, std::vector<uint8_t>& out_rgba, int& width, int& height) {
+    AVStream* stream = fmt_ctx->streams[stream_idx];
+    const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!codec) return false;
 
     AVCodecContext* c_ctx = avcodec_alloc_context3(codec);
-    avcodec_parameters_to_context(c_ctx, codecpar);
+    avcodec_parameters_to_context(c_ctx, stream->codecpar);
     if (avcodec_open2(c_ctx, codec, nullptr) < 0) {
         avcodec_free_context(&c_ctx);
         return false;
     }
 
-    width = c_ctx->width;
-    height = c_ctx->height;
-    out_rgba.resize(width * height * 4);
-
     AVPacket* pkt = av_packet_alloc();
     AVFrame* frame = av_frame_alloc();
     AVFrame* frame_rgb = av_frame_alloc();
 
-    av_image_alloc(frame_rgb->data, frame_rgb->linesize, width, height, AV_PIX_FMT_RGBA, 1);
-    SwsContext* sws = sws_getContext(width, height, c_ctx->pix_fmt, width, height, AV_PIX_FMT_RGBA, SWS_BILINEAR, nullptr, nullptr, nullptr);
+    width = c_ctx->width;
+    height = c_ctx->height;
+    out_rgba.resize(width * height * 4);
 
+    av_image_alloc(frame_rgb->data, frame_rgb->linesize, width, height, AV_PIX_FMT_RGBA, 1);
+
+    SwsContext* sws = sws_getContext(
+        width, height, c_ctx->pix_fmt,
+        width, height, AV_PIX_FMT_RGBA,
+        SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
+    );
+
+    int cur_frame = 0;
     bool got_frame = false;
-    av_seek_frame(fmt_ctx, stream_idx, 0, AVSEEK_FLAG_BACKWARD);
 
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         if (pkt->stream_index == stream_idx) {
             if (avcodec_send_packet(c_ctx, pkt) == 0) {
-                if (avcodec_receive_frame(c_ctx, frame) == 0) {
+                while (avcodec_receive_frame(c_ctx, frame) == 0) {
                     sws_scale(sws, frame->data, frame->linesize, 0, height, frame_rgb->data, frame_rgb->linesize);
                     for (int y = 0; y < height; ++y) {
                         std::memcpy(&out_rgba[y * width * 4], frame_rgb->data[0] + y * frame_rgb->linesize[0], width * 4);
@@ -66,6 +73,7 @@ bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, int64_t target_ts_us,
             }
         }
         av_packet_unref(pkt);
+        if (got_frame) break;
     }
 
     sws_freeContext(sws);
@@ -99,21 +107,21 @@ int main(int argc, char** argv) {
     std::cout << "[Metadata] Camera Model: " << meta.camera_model << std::endl;
     std::cout << "[Metadata] Proto Schema: " << meta.proto_name << std::endl;
     std::cout << "[Metadata] Serial:       " << meta.serial_number << std::endl;
-    std::cout << "[Calibration] Lens 1 (Front):" << std::endl;
+    std::cout << "[Calibration] Lens 1 (Slave, Stream 0):" << std::endl;
     std::cout << "  fx=" << meta.lens_front.fx << " fy=" << meta.lens_front.fy 
               << " cx=" << meta.lens_front.cx << " cy=" << meta.lens_front.cy << std::endl;
     std::cout << "  k=[" << meta.lens_front.k1 << ", " << meta.lens_front.k2 
               << ", " << meta.lens_front.k3 << ", " << meta.lens_front.k4 << "]" << std::endl;
-    std::cout << "  rot=[" << meta.lens_front.quat[0] << ", " << meta.lens_front.quat[1] 
-              << ", " << meta.lens_front.quat[2] << ", " << meta.lens_front.quat[3] << "]" << std::endl;
+    std::cout << "  rot=[w=" << meta.lens_front.quat[0] << ", x=" << meta.lens_front.quat[1] 
+              << ", y=" << meta.lens_front.quat[2] << ", z=" << meta.lens_front.quat[3] << "]" << std::endl;
 
-    std::cout << "[Calibration] Lens 2 (Rear):" << std::endl;
+    std::cout << "[Calibration] Lens 2 (Master, Stream 1):" << std::endl;
     std::cout << "  fx=" << meta.lens_rear.fx << " fy=" << meta.lens_rear.fy 
               << " cx=" << meta.lens_rear.cx << " cy=" << meta.lens_rear.cy << std::endl;
     std::cout << "  k=[" << meta.lens_rear.k1 << ", " << meta.lens_rear.k2 
               << ", " << meta.lens_rear.k3 << ", " << meta.lens_rear.k4 << "]" << std::endl;
-    std::cout << "  rot=[" << meta.lens_rear.quat[0] << ", " << meta.lens_rear.quat[1] 
-              << ", " << meta.lens_rear.quat[2] << ", " << meta.lens_rear.quat[3] << "]" << std::endl;
+    std::cout << "  rot=[w=" << meta.lens_rear.quat[0] << ", x=" << meta.lens_rear.quat[1] 
+              << ", y=" << meta.lens_rear.quat[2] << ", z=" << meta.lens_rear.quat[3] << "]" << std::endl;
 
     // Step 2: Decode 1 frame from each lens stream
     AVFormatContext* fmt_ctx = nullptr;
@@ -123,19 +131,19 @@ int main(int argc, char** argv) {
     }
     avformat_find_stream_info(fmt_ctx, nullptr);
 
-    std::vector<uint8_t> frameFront, frameRear;
-    int w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+    std::vector<uint8_t> frameSlave, frameMaster;
+    int w0 = 0, h0 = 0, w1 = 0, h1 = 0;
 
-    std::cout << "[Decode] Decoding Lens 1 (Stream 0)..." << std::endl;
-    decodeFrame(fmt_ctx, 0, 0, frameFront, w1, h1);
+    std::cout << "[Decode] Decoding Slave Lens (Stream 0)..." << std::endl;
+    decodeFrame(fmt_ctx, 0, 0, frameSlave, w0, h0);
 
-    std::cout << "[Decode] Decoding Lens 2 (Stream 1)..." << std::endl;
-    decodeFrame(fmt_ctx, 1, 0, frameRear, w2, h2);
+    std::cout << "[Decode] Decoding Master Lens (Stream 1)..." << std::endl;
+    decodeFrame(fmt_ctx, 1, 0, frameMaster, w1, h1);
 
     avformat_close_input(&fmt_ctx);
 
-    std::cout << "[Decode] Lens 1: " << w1 << "x" << h1 << " | Lens 2: " << w2 << "x" << h2 << std::endl;
-    if (w1 == 0 || w2 == 0) {
+    std::cout << "[Decode] Stream 0: " << w0 << "x" << h0 << " | Stream 1: " << w1 << "x" << h1 << std::endl;
+    if (w0 == 0 || w1 == 0) {
         std::cerr << "Error decoding frames!" << std::endl;
         return 1;
     }
@@ -148,21 +156,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Step 4: Stitch to Equirectangular (e.g. 3840x1920 preview or full 7680x3840)
+    // Step 4: Stitch to Equirectangular (3840x1920)
     uint32_t out_w = 3840;
     uint32_t out_h = 1920;
     std::vector<uint8_t> out_equirect(out_w * out_h * 4);
 
     std::cout << "[Vulkan] Executing GPU compute stitch (" << out_w << "x" << out_h << ")..." << std::endl;
-    float default_gyro[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    float default_gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
 
     bool ok = stitcher.stitchFrames(
-        frameFront.data(),
-        frameRear.data(),
+        frameMaster.data(),
+        frameSlave.data(),
         w1,
         h1,
-        meta.lens_front,
-        meta.lens_rear,
+        meta.lens_rear,  // Master (Lens 2)
+        meta.lens_front, // Slave (Lens 1)
         default_gyro,
         out_w,
         out_h,

@@ -1,75 +1,71 @@
 #version 450
 layout(local_size_x = 16, local_size_y = 16) in;
 
-// Output stitched equirectangular texture (e.g. 7680x3840 or 3840x1920)
+// Output stitched equirectangular texture (e.g. 3840x1920)
 layout(binding = 0, rgba8) uniform writeonly image2D outEquirect;
 
-// Input lens textures (each 3840x3840)
-layout(binding = 1) uniform sampler2D lensFront;
-layout(binding = 2) uniform sampler2D lensRear;
+// Input lens textures: binding 1 = Master (Stream 1), binding 2 = Slave (Stream 0)
+layout(binding = 1) uniform sampler2D lensMaster;
+layout(binding = 2) uniform sampler2D lensSlave;
 
-// Calibration and Orientation Uniforms
+// Calibration and Orientation Uniforms (128 bytes total - universal Vulkan push constant limit)
 layout(push_constant) uniform PushConstants {
-    // Lens 1 (Front) Intrinsics: fx, fy, cx, cy
-    vec4 lens1_intrinsics;
-    // Lens 1 Distortion: k1, k2, k3, k4
-    vec4 lens1_dist;
-    // Lens 1 Rotation Quaternion: x, y, z, w
-    vec4 lens1_quat;
+    // Lens Master (Stream 1): fx, fy, cx, cy
+    vec4 lens_master_intrinsics;
+    // Lens Master Distortion: k1, k2, k3, k4
+    vec4 lens_master_dist;
+    // Lens Master Rotation Quaternion: w, x, y, z (body to lens)
+    vec4 lens_master_quat;
 
-    // Lens 2 (Rear) Intrinsics: fx, fy, cx, cy
-    vec4 lens2_intrinsics;
-    // Lens 2 Distortion: k1, k2, k3, k4
-    vec4 lens2_dist;
-    // Lens 2 Rotation Quaternion: x, y, z, w
-    vec4 lens2_quat;
+    // Lens Slave (Stream 0): fx, fy, cx, cy
+    vec4 lens_slave_intrinsics;
+    // Lens Slave Distortion: k1, k2, k3, k4
+    vec4 lens_slave_dist;
+    // Lens Slave Rotation Quaternion: w, x, y, z (body to lens)
+    vec4 lens_slave_quat;
 
-    // Gyro Stabilization Quaternion: x, y, z, w
+    // Gyro Stabilization Quaternion: w, x, y, z
     vec4 gyro_quat;
 
-    // Output Dimensions
+    // Output Dimensions & Blend parameters
     uint outWidth;
     uint outHeight;
-    float maxFovDegrees; // typically 195.0
-    float blendOverlapDegrees; // typically 10.0
+    float maxFovDegrees;       // 195.18 deg
+    float blendOverlapDegrees;  // 10.0 deg
 } pc;
 
 #define PI 3.14159265358979323846
 
-// Rotate vector by quaternion: v' = q * v * q^-1
-vec3 rotateByQuat(vec4 q, vec3 v) {
-    vec3 qvec = q.xyz;
+// Rotate vector v by quaternion q = (w, x, y, z): v' = R(q) * v
+vec3 quatRotateWXYZ(vec4 q, vec3 v) {
+    vec3 qvec = q.yzw; // x, y, z
     vec3 uv = cross(qvec, v);
     vec3 uuv = cross(qvec, uv);
-    return v + ((uv * q.w) + uuv) * 2.0;
+    return v + ((uv * q.x) + uuv) * 2.0;
 }
 
-// Invert quaternion (conjugate for unit quat)
-vec4 quatConjugate(vec4 q) {
-    return vec4(-q.xyz, q.w);
+// Invert quaternion (w, -x, -y, -z)
+vec4 quatConjugateWXYZ(vec4 q) {
+    return vec4(q.x, -q.yzw);
 }
 
-// Kannala-Brandt fisheye projection
-vec2 projectFisheye(vec3 ray, vec4 intrinsics, vec4 dist, vec2 texSize) {
-    // ray.z is forward (optical axis)
-    // ray.x is right, ray.y is down/up
-    float r_xy = length(ray.xy);
-    float theta = atan(r_xy, ray.z); // angle from optical axis
+// Kannala-Brandt fisheye projection: lens frame direction -> normalized texture coordinates [0, 1]
+vec2 projectKannalaBrandt(vec3 dLens, vec4 intrinsics, vec4 dist, vec2 texSize, float theta, float rho) {
+    if (rho <= 1e-6) {
+        return vec2(intrinsics.z / texSize.x, intrinsics.w / texSize.y);
+    }
 
-    // Polynomial distortion: theta_d = theta * (1 + k1*theta^2 + k2*theta^4 + k3*theta^6 + k4*theta^8)
+    // Polynomial distortion: rd = theta * (1 + k1*th^2 + k2*th^4 + k3*th^6 + k4*th^8)
     float t2 = theta * theta;
     float t4 = t2 * t2;
     float t6 = t4 * t2;
     float t8 = t4 * t4;
-    float theta_d = theta * (1.0 + dist.x * t2 + dist.y * t4 + dist.z * t6 + dist.w * t8);
+    float rd = theta * (1.0 + dist.x * t2 + dist.y * t4 + dist.z * t6 + dist.w * t8);
 
-    vec2 dir = (r_xy > 1e-6) ? (ray.xy / r_xy) : vec2(0.0);
-    
-    // Pixel coordinates in lens sensor
-    float px = intrinsics.z + intrinsics.x * theta_d * dir.x;
-    float py = intrinsics.w + intrinsics.y * theta_d * dir.y;
+    // Lens frame: +x is image right, +y is image down
+    float px = intrinsics.z + intrinsics.x * rd * (dLens.x / rho);
+    float py = intrinsics.w + intrinsics.y * rd * (dLens.y / rho);
 
-    // Normalize to [0, 1] texture coordinates
     return vec2(px / texSize.x, py / texSize.y);
 }
 
@@ -82,69 +78,74 @@ void main() {
     // Normalized equirectangular coordinates [0, 1]
     vec2 uv = (vec2(pixelCoord) + 0.5) / vec2(pc.outWidth, pc.outHeight);
 
-    // Longitude lambda in [-PI, PI], Latitude phi in [-PI/2, PI/2]
-    float lambda = (uv.x - 0.5) * 2.0 * PI;
-    float phi = (0.5 - uv.y) * PI;
+    // Standard equirectangular projection (aligned with DJI in-camera orientation):
+    // Longitude lon in [-PI, PI], Latitude lat in [PI/2, -PI/2]
+    // Center column matches DJI in-camera LRF reference framing
+    float lon = (uv.x - 0.5) * 2.0 * PI - (PI * 0.5);
+    float lat = (0.5 - uv.y) * PI;
+    float cosLat = cos(lat);
 
-    // 3D ray on unit sphere
-    vec3 ray = vec3(
-        cos(phi) * sin(lambda),
-        sin(phi),
-        cos(phi) * cos(lambda)
+    // Body frame direction vector: X right, Y forward, Z up
+    vec3 dBody = vec3(
+        sin(lon) * cosLat,
+        cos(lon) * cosLat,
+        sin(lat)
     );
 
-    // Apply gyro stabilization (rotate ray by inverse of gyro orientation)
-    vec4 invGyro = quatConjugate(pc.gyro_quat);
-    ray = rotateByQuat(invGyro, ray);
+    // Apply gyro stabilization if active
+    if (abs(pc.gyro_quat.x - 1.0) > 1e-5 || length(pc.gyro_quat.yzw) > 1e-5) {
+        vec4 invGyro = quatConjugateWXYZ(pc.gyro_quat);
+        dBody = quatRotateWXYZ(invGyro, dBody);
+    }
 
-    // Lens 1 (Front) Ray
-    vec4 invLens1 = quatConjugate(pc.lens1_quat);
-    vec3 rayFront = rotateByQuat(invLens1, ray);
-    float thetaFront = atan(length(rayFront.xy), rayFront.z);
+    // Rotate body ray into Master lens frame (+z optical axis): d_lens = R * d_body
+    vec3 dMaster = quatRotateWXYZ(pc.lens_master_quat, dBody);
+    float rhoMaster = length(dMaster.xy);
+    float thMaster = atan(rhoMaster, dMaster.z);
 
-    // Lens 2 (Rear) Ray
-    vec4 invLens2 = quatConjugate(pc.lens2_quat);
-    vec3 rayRear = rotateByQuat(invLens2, ray);
-    float thetaRear = atan(length(rayRear.xy), rayRear.z);
+    // Rotate body ray into Slave lens frame (+z optical axis): d_lens = R * d_body
+    vec3 dSlave = quatRotateWXYZ(pc.lens_slave_quat, dBody);
+    float rhoSlave = length(dSlave.xy);
+    float thSlave = atan(rhoSlave, dSlave.z);
 
-    // Maximum angle covered by each lens (e.g. 195 deg / 2 = 97.5 deg = 1.7017 rad)
-    float maxTheta = (pc.maxFovDegrees * 0.5) * (PI / 180.0);
-    float blendHalf = (pc.blendOverlapDegrees * 0.5) * (PI / 180.0);
-    float blendStart = maxTheta - blendHalf;
-    float blendEnd = maxTheta + blendHalf;
+    // Half field-of-view limits and seam blend band (in radians)
+    float maxTheta = radians(pc.maxFovDegrees * 0.5);
+    float blendOverlap = radians(pc.blendOverlapDegrees);
+    float blendStart = maxTheta - blendOverlap;
+    float blendEnd = maxTheta;
 
-    // Calculate weights with smooth hermite blend across overlap seam
-    float wFront = 1.0 - smoothstep(blendStart, blendEnd, thetaFront);
-    float wRear  = 1.0 - smoothstep(blendStart, blendEnd, thetaRear);
+    // Hermite smoothstep weighting across the overlap band
+    float wMaster = (thMaster <= maxTheta) ? (1.0 - smoothstep(blendStart, blendEnd, thMaster)) : 0.0;
+    float wSlave  = (thSlave  <= maxTheta) ? (1.0 - smoothstep(blendStart, blendEnd, thSlave))  : 0.0;
 
-    vec4 colorFront = vec4(0.0);
-    vec4 colorRear  = vec4(0.0);
+    vec4 colorMaster = vec4(0.0);
+    vec4 colorSlave  = vec4(0.0);
     vec2 sensorSize = vec2(3840.0, 3840.0);
 
-    if (wFront > 0.0) {
-        vec2 uvFront = projectFisheye(rayFront, pc.lens1_intrinsics, pc.lens1_dist, sensorSize);
-        if (uvFront.x >= 0.0 && uvFront.x <= 1.0 && uvFront.y >= 0.0 && uvFront.y <= 1.0) {
-            colorFront = texture(lensFront, uvFront);
+    if (wMaster > 0.0) {
+        vec2 uvMaster = projectKannalaBrandt(dMaster, pc.lens_master_intrinsics, pc.lens_master_dist, sensorSize, thMaster, rhoMaster);
+        if (uvMaster.x >= 0.0 && uvMaster.x <= 1.0 && uvMaster.y >= 0.0 && uvMaster.y <= 1.0) {
+            colorMaster = texture(lensMaster, uvMaster);
         } else {
-            wFront = 0.0;
+            wMaster = 0.0;
         }
     }
 
-    if (wRear > 0.0) {
-        vec2 uvRear = projectFisheye(rayRear, pc.lens2_intrinsics, pc.lens2_dist, sensorSize);
-        if (uvRear.x >= 0.0 && uvRear.x <= 1.0 && uvRear.y >= 0.0 && uvRear.y <= 1.0) {
-            colorRear = texture(lensRear, uvRear);
+    if (wSlave > 0.0) {
+        vec2 uvSlave = projectKannalaBrandt(dSlave, pc.lens_slave_intrinsics, pc.lens_slave_dist, sensorSize, thSlave, rhoSlave);
+        if (uvSlave.x >= 0.0 && uvSlave.x <= 1.0 && uvSlave.y >= 0.0 && uvSlave.y <= 1.0) {
+            colorSlave = texture(lensSlave, uvSlave);
         } else {
-            wRear = 0.0;
+            wSlave = 0.0;
         }
     }
 
-    float totalWeight = wFront + wRear;
+    float totalWeight = wMaster + wSlave;
     vec4 finalColor;
     if (totalWeight > 1e-4) {
-        finalColor = (colorFront * wFront + colorRear * wRear) / totalWeight;
+        finalColor = (colorMaster * wMaster + colorSlave * wSlave) / totalWeight;
     } else {
-        finalColor = vec4(0.0, 0.0, 0.0, 1.0); // Black if outside both lenses
+        finalColor = vec4(0.0, 0.0, 0.0, 1.0);
     }
 
     imageStore(outEquirect, pixelCoord, finalColor);
