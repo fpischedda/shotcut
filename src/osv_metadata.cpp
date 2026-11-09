@@ -419,6 +419,20 @@ bool OsvMetadataParser::parseFromFile(const std::string& osv_path, OsvMetadata& 
         return false;
     }
 
+    // Extract video stream frame rate
+    for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            AVRational r = fmt_ctx->streams[i]->avg_frame_rate;
+            if (r.num <= 0 || r.den <= 0) r = fmt_ctx->streams[i]->r_frame_rate;
+            if (r.num > 0 && r.den > 0) {
+                out_meta.fps_num = r.num;
+                out_meta.fps_den = r.den;
+                out_meta.fps = static_cast<double>(r.num) / r.den;
+            }
+            break;
+        }
+    }
+
     int djmd_stream_idx = -1;
     for (unsigned int i = 0; i < fmt_ctx->nb_streams; ++i) {
         AVStream* st = fmt_ctx->streams[i];

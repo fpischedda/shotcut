@@ -12,6 +12,7 @@ extern "C" {
 #include <vector>
 #include <fstream>
 #include <cstring>
+#include <filesystem>
 
 static void writePPM(const std::string& path, int width, int height, const uint8_t* rgba) {
     std::ofstream ofs(path, std::ios::binary);
@@ -150,7 +151,30 @@ int main(int argc, char** argv) {
 
     // Step 3: Initialize Vulkan Stitcher
     OsvVulkanStitcher stitcher;
-    std::string shader_path = "/home/fra/personal/osmo-360/shaders/osv_stitch.spv";
+    std::string shader_path = "shaders/osv_stitch.spv";
+    const char* env_shader = std::getenv("OSV_SHADER_PATH");
+    if (env_shader && std::filesystem::exists(env_shader)) {
+        shader_path = env_shader;
+    } else if (!std::filesystem::exists(shader_path)) {
+        try {
+            std::filesystem::path exe_dir = std::filesystem::read_symlink("/proc/self/exe").parent_path();
+            std::vector<std::filesystem::path> candidates = {
+                exe_dir / "shaders" / "osv_stitch.spv",
+                exe_dir / ".." / "shaders" / "osv_stitch.spv",
+                "../shaders/osv_stitch.spv"
+            };
+            for (const auto& c : candidates) {
+                if (std::filesystem::exists(c)) {
+                    shader_path = c.string();
+                    break;
+                }
+            }
+        } catch (...) {
+            if (std::filesystem::exists("../shaders/osv_stitch.spv")) {
+                shader_path = "../shaders/osv_stitch.spv";
+            }
+        }
+    }
     if (!stitcher.initialize(shader_path)) {
         std::cerr << "Failed to initialize Vulkan compute pipeline!" << std::endl;
         return 1;
@@ -179,7 +203,10 @@ int main(int argc, char** argv) {
 
     if (ok) {
         std::cout << "[Vulkan] Stitching completed successfully!" << std::endl;
-        std::string out_ppm = "/home/fra/personal/osmo-360/stitched_vulkan_preview.ppm";
+        std::string out_ppm = "stitched_vulkan_preview.ppm";
+        if (argc > 2) {
+            out_ppm = argv[2];
+        }
         writePPM(out_ppm, out_w, out_h, out_equirect.data());
     } else {
         std::cerr << "[Vulkan] Stitching failed!" << std::endl;

@@ -40,10 +40,40 @@ struct ProducerOsvContext {
     mlt_position last_lrf_position = -1;
     mlt_position last_audio_position = -1;
 
+    static std::string resolveShaderPath() {
+        const char* env_path = std::getenv("OSV_SHADER_PATH");
+        if (env_path && std::filesystem::exists(env_path)) {
+            return env_path;
+        }
+        const char* mlt_data = std::getenv("MLT_DATA");
+        if (mlt_data) {
+            std::filesystem::path p = std::filesystem::path(mlt_data).parent_path().parent_path() / "shaders" / "osv_stitch.spv";
+            if (std::filesystem::exists(p)) return p.string();
+        }
+        try {
+            std::filesystem::path exe_dir = std::filesystem::read_symlink("/proc/self/exe").parent_path();
+            std::vector<std::filesystem::path> exe_candidates = {
+                exe_dir / "shaders" / "osv_stitch.spv",
+                exe_dir / ".." / "shaders" / "osv_stitch.spv"
+            };
+            for (const auto& p : exe_candidates) {
+                if (std::filesystem::exists(p)) return p.string();
+            }
+        } catch (...) {}
+        std::vector<std::string> candidates = {
+            "shaders/osv_stitch.spv",
+            "../shaders/osv_stitch.spv"
+        };
+        for (const auto& path : candidates) {
+            if (std::filesystem::exists(path)) return path;
+        }
+        return "shaders/osv_stitch.spv";
+    }
+
     bool ensureStitcher() {
         if (!stitcher) {
             stitcher = std::make_unique<OsvVulkanStitcher>();
-            std::string shader_path = "/home/fra/personal/osmo-360/shaders/osv_stitch.spv";
+            std::string shader_path = resolveShaderPath();
             stitcher_initialized = stitcher->initialize(shader_path);
         }
         return stitcher_initialized;
@@ -111,7 +141,9 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     if (!producer || !producer->child) return 1;
     ProducerOsvContext* ctx = (ProducerOsvContext*)producer->child;
 
-    mlt_position position = mlt_frame_get_position(frame);
+    mlt_position position = mlt_properties_get(MLT_FRAME_PROPERTIES(frame), "original_position")
+        ? mlt_frame_original_position(frame)
+        : mlt_frame_get_position(frame);
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
@@ -156,7 +188,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
             return 1;
         }
 
-        if (position != ctx->last_lrf_position + 1) {
+        if (ctx->last_lrf_position < 0 || position != ctx->last_lrf_position + 1) {
             mlt_producer_seek(ctx->producer_lrf, position);
         }
         ctx->last_lrf_position = position;
@@ -217,7 +249,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     }
 
     // Avoid seeking on sequential playback to prevent GOP decoder flush
-    if (position != ctx->last_position + 1) {
+    if (ctx->last_position < 0 || position != ctx->last_position + 1) {
         mlt_producer_seek(ctx->producer_master, position);
         mlt_producer_seek(ctx->producer_slave, position);
     }
@@ -311,17 +343,32 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
     ProducerOsvContext* ctx = (ProducerOsvContext*)producer->child;
     if (!ctx->producer_audio) return 1;
 
-    mlt_position position = mlt_frame_get_position(frame);
-    if (position != ctx->last_audio_position + 1) {
+    mlt_position position = mlt_properties_get(MLT_FRAME_PROPERTIES(frame), "original_position")
+        ? mlt_frame_original_position(frame)
+        : mlt_frame_get_position(frame);
+    if (ctx->last_audio_position < 0 || position != ctx->last_audio_position + 1) {
         mlt_producer_seek(ctx->producer_audio, position);
     }
     ctx->last_audio_position = position;
 
     mlt_frame audio_frame = nullptr;
-    mlt_service_get_frame(MLT_PRODUCER_SERVICE(ctx->producer_audio), &audio_frame, 0);
-    if (!audio_frame) return 1;
+    int err = mlt_service_get_frame(MLT_PRODUCER_SERVICE(ctx->producer_audio), &audio_frame, 0);
+    if (err != 0 || !audio_frame) return 1;
 
-    int ret = mlt_frame_get_audio(audio_frame, buffer, format, frequency, channels, samples);
+    void* audio_buf = nullptr;
+    int ret = mlt_frame_get_audio(audio_frame, &audio_buf, format, frequency, channels, samples);
+    if (ret == 0 && audio_buf && *samples > 0) {
+        int total_bytes = mlt_audio_format_size(*format, *samples, *channels);
+        *buffer = mlt_pool_alloc(total_bytes);
+        if (*buffer) {
+            std::memcpy(*buffer, audio_buf, total_bytes);
+            mlt_frame_set_audio(frame, *buffer, *format, total_bytes, mlt_pool_release);
+        } else {
+            ret = 1;
+        }
+    } else {
+        ret = 1;
+    }
     mlt_frame_close(audio_frame);
     return ret;
 }
@@ -329,11 +376,23 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
 static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int index) {
     *frame = mlt_frame_init(MLT_PRODUCER_SERVICE(producer));
     if (*frame) {
-        mlt_frame_set_position(*frame, mlt_producer_position(producer));
+        mlt_properties frame_props = MLT_FRAME_PROPERTIES(*frame);
+        mlt_position p_frame = mlt_producer_frame(producer);
+        mlt_position p_pos = mlt_producer_position(producer);
+        mlt_properties_set_position(frame_props, "original_position", p_frame);
+        mlt_frame_set_position(*frame, p_pos);
+
+        // Populate geometry properties on frame so downstream filters receive correct format
+        mlt_properties_set_int(frame_props, "width", 3840);
+        mlt_properties_set_int(frame_props, "height", 1920);
+        mlt_properties_set_double(frame_props, "aspect_ratio", 2.0);
+        mlt_properties_set_int(frame_props, "progressive", 1);
+
         mlt_frame_push_service(*frame, producer);
         mlt_frame_push_get_image(*frame, producer_get_image);
         mlt_frame_push_audio(*frame, producer);
         mlt_frame_push_audio(*frame, (void*)producer_get_audio);
+        mlt_producer_prepare_next(producer);
         return 0;
     }
     return 1;
@@ -367,11 +426,27 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set(props, "mlt_service", "osv");
     mlt_properties_set(props, "shotcut:producer", "avformat");
 
+    ctx->profile = profile;
+    ctx->osv_path = filename ? filename : "";
+
+    // Parse OSV metadata, frame rate, and per-frame attitude telemetry
+    if (filename && OsvMetadataParser::parseFromFile(filename, ctx->metadata)) {
+        mlt_properties_set(props, "meta.camera.model", ctx->metadata.camera_model.c_str());
+        mlt_properties_set(props, "meta.camera.serial", ctx->metadata.serial_number.c_str());
+        mlt_properties_set_int(props, "meta.telemetry.samples", ctx->metadata.telemetry_frames.size());
+    }
+
+    double fps = ctx->metadata.fps > 0.0 ? ctx->metadata.fps : 29.97002997002997;
+    int fps_num = ctx->metadata.fps_num > 0 ? ctx->metadata.fps_num : 30000;
+    int fps_den = ctx->metadata.fps_den > 0 ? ctx->metadata.fps_den : 1001;
+
     // Critical seekability and stream properties for Shotcut UI & Filter dock
     mlt_properties_set_int(props, "seekable", 1);
     mlt_properties_set_int(props, "force_seekable", 1);
     mlt_properties_set_int(props, "video_index", 0);
-    mlt_properties_set_int(props, "audio_index", 0);
+    mlt_properties_set_int(props, "vstream", 0);
+    mlt_properties_set_int(props, "audio_index", 1);
+    mlt_properties_set_int(props, "astream", 0);
     mlt_properties_set_int(props, "mute_on_pause", 0);
 
     // Inject Equirectangular 2:1 aspect ratio and video properties
@@ -379,7 +454,7 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set_int(props, "height", 1920);
     mlt_properties_set_double(props, "aspect_ratio", 2.0);
     mlt_properties_set_int(props, "progressive", 1);
-    mlt_properties_set_double(props, "fps", 25.0);
+    mlt_properties_set_double(props, "fps", fps);
 
     mlt_properties_set_int(props, "meta.media.width", 3840);
     mlt_properties_set_int(props, "meta.media.height", 1920);
@@ -387,8 +462,8 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set_int(props, "meta.media.sample_aspect_num", 1);
     mlt_properties_set_int(props, "meta.media.sample_aspect_den", 1);
     mlt_properties_set_int(props, "meta.media.progressive", 1);
-    mlt_properties_set_double(props, "meta.media.frame_rate_num", 25.0);
-    mlt_properties_set_double(props, "meta.media.frame_rate_den", 1.0);
+    mlt_properties_set_double(props, "meta.media.frame_rate_num", fps_num);
+    mlt_properties_set_double(props, "meta.media.frame_rate_den", fps_den);
     mlt_properties_set_int(props, "meta.media.0.codec.rotate", 0);
     mlt_properties_set_int(props, "rotate", 0);
 
@@ -402,7 +477,8 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set_int(props, "meta.media.0.codec.width", 3840);
     mlt_properties_set_int(props, "meta.media.0.codec.height", 1920);
     mlt_properties_set_double(props, "meta.media.0.codec.aspect_ratio", 2.0);
-    mlt_properties_set_double(props, "meta.media.0.codec.frame_rate", 25.0);
+    mlt_properties_set_double(props, "meta.media.0.codec.frame_rate", fps);
+    mlt_properties_set_double(props, "meta.media.0.stream.frame_rate", fps);
     mlt_properties_set(props, "meta.media.0.codec.pix_fmt", "yuv420p");
     mlt_properties_set_int(props, "meta.media.0.codec.colorspace", 709);
 
@@ -411,15 +487,8 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set(props, "meta.media.1.codec.name", "aac");
     mlt_properties_set(props, "meta.media.1.codec.long_name", "AAC (Advanced Audio Coding)");
     mlt_properties_set_int(props, "meta.media.1.codec.channels", 2);
-    mlt_properties_set(props, "meta.media.1.codec.sample_rate", "48000");
+    mlt_properties_set_int(props, "meta.media.1.codec.sample_rate", 48000);
     mlt_properties_set(props, "meta.media.1.codec.sample_fmt", "fltp");
-
-    // Parse OSV metadata and per-frame attitude telemetry
-    if (filename && OsvMetadataParser::parseFromFile(filename, ctx->metadata)) {
-        mlt_properties_set(props, "meta.camera.model", ctx->metadata.camera_model.c_str());
-        mlt_properties_set(props, "meta.camera.serial", ctx->metadata.serial_number.c_str());
-        mlt_properties_set_int(props, "meta.telemetry.samples", ctx->metadata.telemetry_frames.size());
-    }
 
     // Default stabilization: 1 = Horizon Lock (0 = Off, 1 = Horizon Lock, 2 = Full Lock)
     mlt_properties_set_int(props, "osv.stabilization", 1);
@@ -444,26 +513,27 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
         }
     }
 
-    ctx->profile = profile;
-    ctx->osv_path = filename ? filename : "";
-
     if (ctx->has_lrf) {
         ctx->producer_lrf = mlt_factory_producer(profile, "avformat", ctx->lrf_path.c_str());
         mlt_properties_set(props, "meta.lrf_path", ctx->lrf_path.c_str());
         std::cout << "[OSV-MLT] Detected companion LRF proxy for editing: " << ctx->lrf_path << std::endl;
     }
 
-    // Stream 2: Dedicated audio producer
+    // Stream 2 in OSV container: Dedicated audio producer
     ctx->producer_audio = mlt_factory_producer(profile, "avformat", filename);
     if (ctx->producer_audio) {
-        mlt_properties_set_int(MLT_PRODUCER_PROPERTIES(ctx->producer_audio), "audio_index", 0);
-        mlt_properties_set_int(MLT_PRODUCER_PROPERTIES(ctx->producer_audio), "astream", 2);
+        mlt_properties aprops = MLT_PRODUCER_PROPERTIES(ctx->producer_audio);
+        mlt_properties_set_int(aprops, "video_index", -1);
+        mlt_properties_set_int(aprops, "audio_index", 2);
+        mlt_properties_set_int(aprops, "astream", 0);
     }
 
-    // Set duration and timeline in/out bounds (from LRF if available, otherwise from master stream)
+    // Set duration and timeline in/out bounds (from LRF if available, otherwise from audio/master stream)
     mlt_position length = 0;
     if (ctx->producer_lrf) {
         length = mlt_producer_get_length(ctx->producer_lrf);
+    } else if (ctx->producer_audio) {
+        length = mlt_producer_get_length(ctx->producer_audio);
     } else {
         ctx->ensureFullProducers();
         if (ctx->producer_master) {

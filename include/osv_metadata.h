@@ -40,6 +40,9 @@ struct OsvMetadata {
     uint32_t width = 3840;
     uint32_t height = 3840;
     uint32_t sample_rate_hz = 1000;
+    int fps_num = 30000;
+    int fps_den = 1001;
+    double fps = 29.97002997002997;
 
     LensCalibration lens_front;
     LensCalibration lens_rear;

@@ -80,7 +80,15 @@ target_link_libraries(mltosv PRIVATE
 set_target_properties(mltosv PROPERTIES
     PREFIX "lib"
     OUTPUT_NAME "mltosv"
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/plugins"
 )
+
+# Setup MLT runtime environment (symlinks to system plugins + loader.dict)
+add_custom_target(setup_mlt_env ALL
+    COMMAND ${CMAKE_CURRENT_SOURCE_DIR}/scripts/setup_mlt_env.sh "${CMAKE_CURRENT_BINARY_DIR}"
+    COMMENT "Setting up MLT environment symlinks and loader.dict"
+)
+add_dependencies(mltosv setup_mlt_env)
 
 # High-Performance Frei0r Bigsh0t Equirectangular to Rectilinear Filter
 find_package(OpenMP REQUIRED)
