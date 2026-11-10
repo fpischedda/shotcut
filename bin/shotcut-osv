@@ -6,6 +6,7 @@ export OSV_SHADER_PATH="${SCRIPT_DIR}/shaders/osv_stitch.spv"
 export MLT_REPOSITORY="${SCRIPT_DIR}/build/plugins"
 export MLT_DATA="${SCRIPT_DIR}/build/share/mlt-7"
 export FREI0R_PATH="${SCRIPT_DIR}/build/plugins/frei0r:/usr/lib/frei0r-1:/usr/lib64/frei0r-1"
+export OSV_PREVIEW_MODE="${OSV_PREVIEW_MODE:-auto}"
 
-echo "[Shotcut-OSV] Initializing with MLT_REPOSITORY=${MLT_REPOSITORY}"
+echo "[Shotcut-OSV] Initializing with MLT_REPOSITORY=${MLT_REPOSITORY} (preview_mode=${OSV_PREVIEW_MODE})"
 exec /usr/bin/shotcut "$@"

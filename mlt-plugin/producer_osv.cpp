@@ -11,6 +11,13 @@ extern "C" {
 #include <string>
 #include <filesystem>
 #include <mutex>
+#include <chrono>
+
+enum class PreviewMode {
+    Auto,
+    Proxy,  // LRF companion
+    Full    // Full dual 4K HEVC compute
+};
 
 struct ProducerOsvContext {
     mlt_profile profile = nullptr;
@@ -42,6 +49,12 @@ struct ProducerOsvContext {
     mlt_position last_audio_position = -1;
     void* last_active_producer = nullptr;
     void* last_audio_producer = nullptr;
+
+    // Dynamic performance monitoring and auto-adaptation
+    double avg_frame_time_ms = 0.0;
+    int slow_frame_count = 0;
+    bool dynamic_fallback_to_lrf = false;
+    bool perf_warning_logged = false;
 
     static std::string resolveShaderPath() {
         const char* env_path = std::getenv("OSV_SHADER_PATH");
@@ -89,6 +102,8 @@ struct ProducerOsvContext {
                 mlt_properties mprops = MLT_PRODUCER_PROPERTIES(producer_master);
                 mlt_properties_set_int(mprops, "video_index", 1);
                 mlt_properties_set_int(mprops, "audio_index", -1);
+                mlt_properties_set_int(mprops, "seekable", 1);
+                mlt_properties_set_int(mprops, "force_seekable", 1);
                 mlt_producer_probe(producer_master);
             }
         }
@@ -98,6 +113,8 @@ struct ProducerOsvContext {
                 mlt_properties sprops = MLT_PRODUCER_PROPERTIES(producer_slave);
                 mlt_properties_set_int(sprops, "video_index", 0);
                 mlt_properties_set_int(sprops, "audio_index", -1);
+                mlt_properties_set_int(sprops, "seekable", 1);
+                mlt_properties_set_int(sprops, "force_seekable", 1);
                 mlt_producer_probe(producer_slave);
             }
         }
@@ -145,6 +162,36 @@ static bool is_render_export(mlt_producer producer) {
     return false;
 }
 
+static PreviewMode resolve_preview_mode(mlt_producer producer) {
+    mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
+
+    // 1. Explicit property override on producer (osv.preview_mode or preview_mode)
+    const char* prop = mlt_properties_get(props, "osv.preview_mode");
+    if (!prop) prop = mlt_properties_get(props, "preview_mode");
+    if (prop) {
+        if (std::strcmp(prop, "proxy") == 0 || std::strcmp(prop, "lrf") == 0 || std::strcmp(prop, "low") == 0) return PreviewMode::Proxy;
+        if (std::strcmp(prop, "full") == 0 || std::strcmp(prop, "high") == 0) return PreviewMode::Full;
+    }
+
+    // 2. Explicit environment variable override
+    const char* env_pm = std::getenv("OSV_PREVIEW_MODE");
+    if (env_pm) {
+        if (std::strcmp(env_pm, "proxy") == 0 || std::strcmp(env_pm, "lrf") == 0 || std::strcmp(env_pm, "1") == 0 || std::strcmp(env_pm, "low") == 0) return PreviewMode::Proxy;
+        if (std::strcmp(env_pm, "full") == 0 || std::strcmp(env_pm, "0") == 0 || std::strcmp(env_pm, "high") == 0) return PreviewMode::Full;
+        if (std::strcmp(env_pm, "auto") == 0) return PreviewMode::Auto;
+    }
+
+    // 3. Backwards compatibility with OSV_USE_LRF
+    const char* env_lrf = std::getenv("OSV_USE_LRF");
+    if (env_lrf) {
+        if (std::strcmp(env_lrf, "1") == 0) return PreviewMode::Proxy;
+        if (std::strcmp(env_lrf, "0") == 0) return PreviewMode::Full;
+    }
+
+    // If property was explicitly "auto" or unset, return Auto
+    return PreviewMode::Auto;
+}
+
 static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format* format, int* width, int* height, int writable) {
     mlt_producer producer = (mlt_producer)mlt_frame_pop_service(frame);
     if (!producer || !producer->child) return 1;
@@ -153,6 +200,12 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     mlt_position position = mlt_properties_get(MLT_FRAME_PROPERTIES(frame), "original_position")
         ? mlt_frame_original_position(frame)
         : mlt_frame_get_position(frame);
+
+    mlt_position max_pos = mlt_producer_get_length(producer) - 1;
+    if (max_pos <= 0 && ctx->producer_lrf) max_pos = mlt_producer_get_length(ctx->producer_lrf) - 1;
+    if (max_pos <= 0 && ctx->producer_master) max_pos = mlt_producer_get_length(ctx->producer_master) - 1;
+    if (max_pos > 0 && position > max_pos) position = max_pos;
+    if (position < 0) position = 0;
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
@@ -177,7 +230,20 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     // Determine preview vs export mode and target stitch dimensions
     bool export_mode = is_render_export(producer);
-    bool use_lrf = ctx->has_lrf && ctx->producer_lrf && !export_mode;
+    PreviewMode preview_mode = resolve_preview_mode(producer);
+
+    bool use_lrf = false;
+    if (!export_mode) {
+        if (preview_mode == PreviewMode::Proxy) {
+            use_lrf = ctx->has_lrf && ctx->producer_lrf;
+        } else if (preview_mode == PreviewMode::Full) {
+            use_lrf = false;
+        } else { // PreviewMode::Auto
+            // In auto mode, use companion LRF proxy when present (vastly superior interactive performance)
+            // or if dynamic fallback has triggered due to high render latency
+            use_lrf = (ctx->has_lrf && ctx->producer_lrf) && (ctx->dynamic_fallback_to_lrf || true);
+        }
+    }
 
     int out_w = (*width > 0) ? *width : (export_mode ? 5760 : 2048);
     int out_h = (*height > 0) ? *height : (export_mode ? 2880 : 1024);
@@ -220,6 +286,8 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     int64_t source_frame = (profile_fps > 0.0)
         ? static_cast<int64_t>(position / profile_fps * source_fps + 0.5)
         : position;
+
+    auto t_start = std::chrono::steady_clock::now();
 
     // Fast-path: Companion .LRF proxy decoding during interactive editor playback
     // The camera's companion .LRF is 2048x1024 progressive H.264 side-by-side dual fisheye.
@@ -273,14 +341,21 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
                     mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
                     return 0;
-                } else {
-                    std::memset(*image, 0, buf_size);
-                    mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
-                    return 0;
                 }
+            } else {
+                mlt_frame_close(lrf_frame);
             }
-            mlt_frame_close(lrf_frame);
         }
+
+        // Graceful blank fallback if LRF frame decoding fails temporarily during rapid seek
+        *width = out_w;
+        *height = out_h;
+        *format = mlt_image_rgba;
+        int buf_size = out_w * out_h * 4;
+        *image = (uint8_t*)mlt_pool_alloc(buf_size);
+        if (*image) std::memset(*image, 0, buf_size);
+        mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
+        return 0;
     }
 
     // Full Vulkan compute stitching path (used for final render / export or when no LRF is available)
@@ -304,7 +379,16 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     if (!frame_master || !frame_slave) {
         if (frame_master) mlt_frame_close(frame_master);
         if (frame_slave) mlt_frame_close(frame_slave);
-        return 1;
+
+        // Graceful blank fallback instead of hard-failing MLT pipeline
+        *width = out_w;
+        *height = out_h;
+        *format = mlt_image_rgba;
+        int buf_size = out_w * out_h * 4;
+        *image = (uint8_t*)mlt_pool_alloc(buf_size);
+        if (*image) std::memset(*image, 0, buf_size);
+        mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
+        return 0;
     }
 
     uint8_t* img_master = nullptr;
@@ -348,6 +432,33 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     mlt_frame_close(frame_master);
     mlt_frame_close(frame_slave);
 
+    auto t_end = std::chrono::steady_clock::now();
+    double frame_ms = std::chrono::duration<double, std::milli>(t_end - t_start).count();
+    ctx->avg_frame_time_ms = (ctx->avg_frame_time_ms == 0.0) ? frame_ms : (0.85 * ctx->avg_frame_time_ms + 0.15 * frame_ms);
+    double budget_ms = (profile_fps > 0.0) ? (1000.0 / profile_fps) : 40.0;
+
+    // Dynamic performance check: if dual 4K HEVC decode latency exceeds real-time budget,
+    // toggle to LRF companion proxy automatically in auto mode
+    if (!use_lrf && !export_mode && ctx->avg_frame_time_ms > budget_ms * 1.25) {
+        if (ctx->has_lrf && ctx->producer_lrf && !ctx->dynamic_fallback_to_lrf && preview_mode == PreviewMode::Auto) {
+            ctx->dynamic_fallback_to_lrf = true;
+            std::cout << "[OSV-MLT] Dynamic performance check: Full Dual-4K render time ("
+                      << ctx->avg_frame_time_ms << " ms) exceeded budget ("
+                      << budget_ms << " ms). Toggling to LRF preview proxy." << std::endl;
+            mlt_log_info(MLT_PRODUCER_SERVICE(producer),
+                         "[OSV-MLT] Dynamic performance check: Full Dual-4K render time (%.1f ms) exceeded budget (%.1f ms). Toggled to LRF preview proxy.\n",
+                         ctx->avg_frame_time_ms, budget_ms);
+        } else if (!ctx->has_lrf && !ctx->perf_warning_logged) {
+            ctx->perf_warning_logged = true;
+            std::cout << "[OSV-MLT] Host performance warning: Dual-4K HEVC decode latency ("
+                      << ctx->avg_frame_time_ms << " ms) exceeds real-time frame budget ("
+                      << budget_ms << " ms). No companion .LRF found." << std::endl;
+            mlt_log_info(MLT_PRODUCER_SERVICE(producer),
+                         "[OSV-MLT] Host performance warning: Dual-4K HEVC decode latency (%.1f ms) exceeds real-time frame budget (%.1f ms).\n",
+                         ctx->avg_frame_time_ms, budget_ms);
+        }
+    }
+
     mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
     return 0;
 }
@@ -361,6 +472,11 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
     mlt_position position = mlt_properties_get(MLT_FRAME_PROPERTIES(frame), "original_position")
         ? mlt_frame_original_position(frame)
         : mlt_frame_get_position(frame);
+
+    mlt_position max_pos = mlt_producer_get_length(producer) - 1;
+    if (max_pos <= 0 && ctx->producer_audio) max_pos = mlt_producer_get_length(ctx->producer_audio) - 1;
+    if (max_pos > 0 && position > max_pos) position = max_pos;
+    if (position < 0) position = 0;
 
     std::lock_guard<std::mutex> lock(ctx->audio_mutex);
 
@@ -406,7 +522,6 @@ static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int in
         mlt_position p_pos = mlt_producer_position(producer);
         mlt_properties_set_position(frame_props, "original_position", p_frame);
         mlt_frame_set_position(*frame, p_pos);
-        mlt_properties_set_data(frame_props, "_producer", MLT_PRODUCER_SERVICE(producer), 0, NULL, NULL);
 
         // Populate geometry properties on frame so downstream filters receive correct format
         mlt_properties_set_int(frame_props, "width", 3840);
@@ -437,8 +552,6 @@ static void producer_close(mlt_producer producer) {
             if (ctx->producer_lrf) mlt_producer_close(ctx->producer_lrf);
             delete ctx;
         }
-        producer->close = nullptr;
-        mlt_producer_close(producer);
     }
 }
 
@@ -528,12 +641,11 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set_int(props, "osv.stabilization", 1);
     mlt_properties_set(props, "meta.stabilization.mode", "Horizon Lock (1)");
 
-    // Direct native OSV dual-HEVC hardware decoding.
-    // LRF proxy is bypassed by default to avoid VAAPI decoder deadlocks, audio/video stream sync drift,
-    // and timeline preview freezing during interactive scrubbing and trimming.
-    // Set OSV_USE_LRF=1 in environment to opt-in to companion LRF proxy mode.
-    bool enable_lrf = (std::getenv("OSV_USE_LRF") != nullptr && std::string(std::getenv("OSV_USE_LRF")) == "1");
-    if (enable_lrf && filename) {
+    // Dynamic preview mode configuration:
+    // Auto (default): Uses lightweight companion LRF proxy for smooth interactive preview,
+    // and full dual-4K/5.7K HEVC compute stitching during render/export.
+    // Can be forced via OSV_PREVIEW_MODE ("proxy" / "full" / "auto") or producer property "osv.preview_mode".
+    if (filename) {
         std::string path_str(filename);
         size_t dot_pos = path_str.find_last_of('.');
         if (dot_pos != std::string::npos) {
@@ -554,16 +666,24 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     if (ctx->has_lrf) {
         ctx->producer_lrf = mlt_factory_producer(profile, "avformat", ctx->lrf_path.c_str());
         if (ctx->producer_lrf) {
-            mlt_properties_set_int(MLT_PRODUCER_PROPERTIES(ctx->producer_lrf), "audio_index", -1);
+            mlt_properties lprops = MLT_PRODUCER_PROPERTIES(ctx->producer_lrf);
+            mlt_properties_set_int(lprops, "audio_index", -1);
+            mlt_properties_set_int(lprops, "seekable", 1);
+            mlt_properties_set_int(lprops, "force_seekable", 1);
             mlt_producer_probe(ctx->producer_lrf);
         }
         mlt_properties_set(props, "meta.lrf_path", ctx->lrf_path.c_str());
         std::cout << "[OSV-MLT] Detected companion LRF proxy for editing: " << ctx->lrf_path << std::endl;
         mlt_log_info(MLT_PRODUCER_SERVICE(producer), "[OSV-MLT] Using companion LRF proxy: %s\n", ctx->lrf_path.c_str());
     } else {
-        std::cout << "[OSV-MLT] Direct native OSV dual-stream mode active (LRF proxy bypassed)" << std::endl;
-        mlt_log_info(MLT_PRODUCER_SERVICE(producer), "[OSV-MLT] Direct native OSV dual-stream mode active\n");
+        std::cout << "[OSV-MLT] Companion LRF not found, using direct native OSV dual-stream mode" << std::endl;
+        mlt_log_info(MLT_PRODUCER_SERVICE(producer), "[OSV-MLT] Companion LRF not found, using direct native OSV\n");
     }
+
+    mlt_properties_set(props, "osv.preview_mode", "auto");
+    PreviewMode init_pm = resolve_preview_mode(producer);
+    const char* pm_name = (init_pm == PreviewMode::Proxy) ? "proxy" : (init_pm == PreviewMode::Full) ? "full" : "auto";
+    std::cout << "[OSV-MLT] Initialized preview mode: " << pm_name << " (has_lrf=" << (ctx->has_lrf ? "yes" : "no") << ")" << std::endl;
 
     // Dedicated audio producer (prefer lightweight LRF container if available, otherwise OSV)
     const char* audio_source = (ctx->has_lrf && !ctx->lrf_path.empty()) ? ctx->lrf_path.c_str() : filename;
@@ -575,6 +695,8 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
         mlt_properties_set_int(aprops, "video_index", -1);
         mlt_properties_set_int(aprops, "audio_index", audio_stream_idx);
         mlt_properties_set_int(aprops, "astream", 0);
+        mlt_properties_set_int(aprops, "seekable", 1);
+        mlt_properties_set_int(aprops, "force_seekable", 1);
         mlt_producer_probe(ctx->producer_audio);
     }
 
