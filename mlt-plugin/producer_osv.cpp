@@ -16,6 +16,7 @@ struct ProducerOsvContext {
     mlt_profile profile = nullptr;
     std::string osv_path;
     std::mutex mutex;
+    std::mutex audio_mutex;
 
     mlt_producer producer_slave = nullptr;  // Stream 0: Slave lens (Rear)
     mlt_producer producer_master = nullptr; // Stream 1: Master lens (Front)
@@ -85,13 +86,19 @@ struct ProducerOsvContext {
         if (!producer_master) {
             producer_master = mlt_factory_producer(profile, "avformat", osv_path.c_str());
             if (producer_master) {
-                mlt_properties_set_int(MLT_PRODUCER_PROPERTIES(producer_master), "video_index", 1);
+                mlt_properties mprops = MLT_PRODUCER_PROPERTIES(producer_master);
+                mlt_properties_set_int(mprops, "video_index", 1);
+                mlt_properties_set_int(mprops, "audio_index", -1);
+                mlt_producer_probe(producer_master);
             }
         }
         if (!producer_slave) {
             producer_slave = mlt_factory_producer(profile, "avformat", osv_path.c_str());
             if (producer_slave) {
-                mlt_properties_set_int(MLT_PRODUCER_PROPERTIES(producer_slave), "video_index", 0);
+                mlt_properties sprops = MLT_PRODUCER_PROPERTIES(producer_slave);
+                mlt_properties_set_int(sprops, "video_index", 0);
+                mlt_properties_set_int(sprops, "audio_index", -1);
+                mlt_producer_probe(producer_slave);
             }
         }
         return producer_master && producer_slave && ensureStitcher();
@@ -355,7 +362,7 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
         ? mlt_frame_original_position(frame)
         : mlt_frame_get_position(frame);
 
-    std::lock_guard<std::mutex> lock(ctx->mutex);
+    std::lock_guard<std::mutex> lock(ctx->audio_mutex);
 
     void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
     if (!current_prod) current_prod = producer;
@@ -379,6 +386,8 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
         if (*buffer) {
             std::memcpy(*buffer, audio_buf, total_bytes);
             mlt_frame_set_audio(frame, *buffer, *format, total_bytes, mlt_pool_release);
+            const char* layout = mlt_properties_get(MLT_FRAME_PROPERTIES(audio_frame), "channel_layout");
+            mlt_properties_set(MLT_FRAME_PROPERTIES(frame), "channel_layout", layout ? layout : "stereo");
         } else {
             ret = 1;
         }
@@ -397,6 +406,7 @@ static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int in
         mlt_position p_pos = mlt_producer_position(producer);
         mlt_properties_set_position(frame_props, "original_position", p_frame);
         mlt_frame_set_position(*frame, p_pos);
+        mlt_properties_set_data(frame_props, "_producer", MLT_PRODUCER_SERVICE(producer), 0, NULL, NULL);
 
         // Populate geometry properties on frame so downstream filters receive correct format
         mlt_properties_set_int(frame_props, "width", 3840);
@@ -415,17 +425,21 @@ static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int in
 }
 
 static void producer_close(mlt_producer producer) {
-    if (producer && producer->child) {
-        ProducerOsvContext* ctx = (ProducerOsvContext*)producer->child;
-        std::lock_guard<std::mutex> lock(ctx->mutex);
-        producer->child = nullptr;
-        if (ctx->producer_master) mlt_producer_close(ctx->producer_master);
-        if (ctx->producer_slave) mlt_producer_close(ctx->producer_slave);
-        if (ctx->producer_audio) mlt_producer_close(ctx->producer_audio);
-        if (ctx->producer_lrf) mlt_producer_close(ctx->producer_lrf);
-        delete ctx;
+    if (producer) {
+        if (producer->child) {
+            ProducerOsvContext* ctx = (ProducerOsvContext*)producer->child;
+            std::lock_guard<std::mutex> lock(ctx->mutex);
+            std::lock_guard<std::mutex> audio_lock(ctx->audio_mutex);
+            producer->child = nullptr;
+            if (ctx->producer_master) mlt_producer_close(ctx->producer_master);
+            if (ctx->producer_slave) mlt_producer_close(ctx->producer_slave);
+            if (ctx->producer_audio) mlt_producer_close(ctx->producer_audio);
+            if (ctx->producer_lrf) mlt_producer_close(ctx->producer_lrf);
+            delete ctx;
+        }
+        producer->close = nullptr;
+        mlt_producer_close(producer);
     }
-    producer->close = nullptr;
 }
 
 extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type type, const char* id, const char* filename) {
@@ -436,11 +450,15 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     producer->child = ctx;
     producer->get_frame = producer_get_frame;
     producer->close = (mlt_destructor)producer_close;
+    producer->close_object = producer;
 
     mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
     mlt_properties_set(props, "resource", filename);
     mlt_properties_set(props, "mlt_service", "osv");
     mlt_properties_set(props, "shotcut:producer", "avformat");
+
+    mlt_log_info(MLT_PRODUCER_SERVICE(producer), "[OSV-MLT] Loaded native OSV plugin (build 2026-11-10 direct-osv-v3)\n");
+    std::cout << "[OSV-MLT] Loaded native OSV plugin (build 2026-11-10 direct-osv-v3)" << std::endl;
 
     ctx->profile = profile;
     ctx->osv_path = filename ? filename : "";
@@ -510,8 +528,12 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set_int(props, "osv.stabilization", 1);
     mlt_properties_set(props, "meta.stabilization.mode", "Horizon Lock (1)");
 
-    // Check for companion .LRF proxy file (e.g. CAM_..._D.LRF)
-    if (filename) {
+    // Direct native OSV dual-HEVC hardware decoding.
+    // LRF proxy is bypassed by default to avoid VAAPI decoder deadlocks, audio/video stream sync drift,
+    // and timeline preview freezing during interactive scrubbing and trimming.
+    // Set OSV_USE_LRF=1 in environment to opt-in to companion LRF proxy mode.
+    bool enable_lrf = (std::getenv("OSV_USE_LRF") != nullptr && std::string(std::getenv("OSV_USE_LRF")) == "1");
+    if (enable_lrf && filename) {
         std::string path_str(filename);
         size_t dot_pos = path_str.find_last_of('.');
         if (dot_pos != std::string::npos) {
@@ -531,17 +553,29 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
 
     if (ctx->has_lrf) {
         ctx->producer_lrf = mlt_factory_producer(profile, "avformat", ctx->lrf_path.c_str());
+        if (ctx->producer_lrf) {
+            mlt_properties_set_int(MLT_PRODUCER_PROPERTIES(ctx->producer_lrf), "audio_index", -1);
+            mlt_producer_probe(ctx->producer_lrf);
+        }
         mlt_properties_set(props, "meta.lrf_path", ctx->lrf_path.c_str());
         std::cout << "[OSV-MLT] Detected companion LRF proxy for editing: " << ctx->lrf_path << std::endl;
+        mlt_log_info(MLT_PRODUCER_SERVICE(producer), "[OSV-MLT] Using companion LRF proxy: %s\n", ctx->lrf_path.c_str());
+    } else {
+        std::cout << "[OSV-MLT] Direct native OSV dual-stream mode active (LRF proxy bypassed)" << std::endl;
+        mlt_log_info(MLT_PRODUCER_SERVICE(producer), "[OSV-MLT] Direct native OSV dual-stream mode active\n");
     }
 
-    // Stream 2 in OSV container: Dedicated audio producer
-    ctx->producer_audio = mlt_factory_producer(profile, "avformat", filename);
+    // Dedicated audio producer (prefer lightweight LRF container if available, otherwise OSV)
+    const char* audio_source = (ctx->has_lrf && !ctx->lrf_path.empty()) ? ctx->lrf_path.c_str() : filename;
+    int audio_stream_idx = (ctx->has_lrf && !ctx->lrf_path.empty()) ? 1 : 2;
+
+    ctx->producer_audio = mlt_factory_producer(profile, "avformat", audio_source);
     if (ctx->producer_audio) {
         mlt_properties aprops = MLT_PRODUCER_PROPERTIES(ctx->producer_audio);
         mlt_properties_set_int(aprops, "video_index", -1);
-        mlt_properties_set_int(aprops, "audio_index", 2);
+        mlt_properties_set_int(aprops, "audio_index", audio_stream_idx);
         mlt_properties_set_int(aprops, "astream", 0);
+        mlt_producer_probe(ctx->producer_audio);
     }
 
     // Set duration and timeline in/out bounds (from LRF if available, otherwise from audio/master stream)

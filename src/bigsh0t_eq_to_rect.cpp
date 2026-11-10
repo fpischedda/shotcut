@@ -88,6 +88,11 @@ public:
         float r_deg = static_cast<float>(roll);
         float fov_deg = static_cast<float>(fov);
         float fe = static_cast<float>(fisheye);
+        if (fov_deg <= 0.0f) {
+            fov_deg = 90.0f;
+        } else if (fov_deg > 179.0f && fe <= 1e-4f) {
+            fov_deg = 179.0f;
+        }
 
         Mat3f M = buildRotation(y_deg, p_deg, r_deg);
         float tan_half_fov = std::tan(0.5f * fov_deg * (PI / 180.0f));
@@ -224,24 +229,24 @@ public:
                 }
                 uint32_t fx = m[i].fx;
                 uint32_t fy = m[i].fy;
-                const uint32_t* p = inframe + off;
-                uint32_t p00 = p[0], p10 = p[1], p01 = p[stride], p11 = p[stride + 1];
-
-                uint32_t rb00 = p00 & 0x00FF00FFu, ag00 = (p00 >> 8) & 0x00FF00FFu;
-                uint32_t rb10 = p10 & 0x00FF00FFu, ag10 = (p10 >> 8) & 0x00FF00FFu;
-                uint32_t rb01 = p01 & 0x00FF00FFu, ag01 = (p01 >> 8) & 0x00FF00FFu;
-                uint32_t rb11 = p11 & 0x00FF00FFu, ag11 = (p11 >> 8) & 0x00FF00FFu;
+                const uint8_t* p00 = reinterpret_cast<const uint8_t*>(inframe + off);
+                const uint8_t* p10 = p00 + 4;
+                const uint8_t* p01 = p00 + stride * 4;
+                const uint8_t* p11 = p01 + 4;
 
                 uint32_t ifx = 256 - fx;
                 uint32_t ify = 256 - fy;
-                uint32_t rb0 = rb00 * ifx + rb10 * fx;
-                uint32_t rb1 = rb01 * ifx + rb11 * fx;
-                uint32_t ag0 = ag00 * ifx + ag10 * fx;
-                uint32_t ag1 = ag01 * ifx + ag11 * fx;
+                uint32_t w00 = ifx * ify;
+                uint32_t w10 = fx * ify;
+                uint32_t w01 = ifx * fy;
+                uint32_t w11 = fx * fy;
 
-                uint32_t rb = ((rb0 * ify + rb1 * fy) >> 16) & 0x00FF00FFu;
-                uint32_t ag = ((ag0 * ify + ag1 * fy) >> 8) & 0xFF00FF00u;
-                outframe[i] = rb | ag;
+                uint32_t r = (p00[0] * w00 + p10[0] * w10 + p01[0] * w01 + p11[0] * w11 + 32768) >> 16;
+                uint32_t g = (p00[1] * w00 + p10[1] * w10 + p01[1] * w01 + p11[1] * w11 + 32768) >> 16;
+                uint32_t b = (p00[2] * w00 + p10[2] * w10 + p01[2] * w01 + p11[2] * w11 + 32768) >> 16;
+                uint32_t a = (p00[3] * w00 + p10[3] * w10 + p01[3] * w01 + p11[3] * w11 + 32768) >> 16;
+
+                outframe[i] = (a << 24) | (b << 16) | (g << 8) | r;
             }
         }
     }
@@ -327,6 +332,7 @@ void f0r_set_param_value(f0r_instance_t instance, f0r_param_t param, int param_i
             if (inst->roll != val) { inst->roll = val; inst->dirty = true; }
             break;
         case 3:
+            if (val <= 0.0) val = 90.0;
             if (inst->fov != val) { inst->fov = val; inst->dirty = true; }
             break;
         case 4:

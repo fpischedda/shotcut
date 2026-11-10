@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Shotcut with native DJI Osmo 360 (.OSV) support
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
 
 export OSV_SHADER_PATH="${SCRIPT_DIR}/shaders/osv_stitch.spv"
 export MLT_REPOSITORY="${SCRIPT_DIR}/build/plugins"

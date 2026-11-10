@@ -9,6 +9,8 @@ bin/build/
 # Large test files and renders
 *.ppm
 *.mp4
+*.png
+*.wav
 test_out*
 melt_stitched*
 *.jpg
