@@ -21,7 +21,8 @@ done
 for d in /usr/share/mlt-7/*; do
     name="$(basename "$d")"
     if [ "$name" != "core" ]; then
-        ln -sfn "$d" "${BUILD_DIR}/share/mlt-7/"
+        rm -rf "${BUILD_DIR}/share/mlt-7/${name}"
+        ln -sfn "$d" "${BUILD_DIR}/share/mlt-7/${name}"
     fi
 done
 
@@ -29,7 +30,8 @@ done
 for f in /usr/share/mlt-7/core/*; do
     name="$(basename "$f")"
     if [ "$name" != "loader.dict" ]; then
-        ln -sfn "$f" "${BUILD_DIR}/share/mlt-7/core/"
+        rm -rf "${BUILD_DIR}/share/mlt-7/core/${name}"
+        ln -sfn "$f" "${BUILD_DIR}/share/mlt-7/core/${name}"
     fi
 done
 

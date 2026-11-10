@@ -39,6 +39,8 @@ struct ProducerOsvContext {
     mlt_position last_position = -1;
     mlt_position last_lrf_position = -1;
     mlt_position last_audio_position = -1;
+    void* last_active_producer = nullptr;
+    void* last_audio_producer = nullptr;
 
     static std::string resolveShaderPath() {
         const char* env_path = std::getenv("OSV_SHADER_PATH");
@@ -147,6 +149,11 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
+    void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
+    if (!current_prod) current_prod = producer;
+    bool cut_changed = (current_prod != ctx->last_active_producer);
+    ctx->last_active_producer = current_prod;
+
     // Gyro stabilization mode: 0 = Off, 1 = Horizon Lock (default), 2 = Full Lock
     mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
     int stab_mode = 1;
@@ -161,34 +168,62 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
         }
     }
 
-    // Fast-path: Companion .LRF proxy decoding during interactive editor playback
-    // The camera's companion .LRF is 2048x1024 progressive H.264 side-by-side dual fisheye.
-    // Left half (1024x1024) is Slave lens (Stream 0), Right half (1024x1024) is Master lens (Stream 1).
+    // Determine preview vs export mode and target stitch dimensions
     bool export_mode = is_render_export(producer);
     bool use_lrf = ctx->has_lrf && ctx->producer_lrf && !export_mode;
+
+    int out_w = (*width > 0) ? *width : (export_mode ? 5760 : 2048);
+    int out_h = (*height > 0) ? *height : (export_mode ? 2880 : 1024);
+
+    if (export_mode && (*width <= 0 || *height <= 0)) {
+        const char* export_res = mlt_properties_get(props, "osv.export_res");
+        if (!export_res) export_res = std::getenv("OSV_EXPORT_RES");
+        if (export_res) {
+            if (std::strcmp(export_res, "4k") == 0 || std::strcmp(export_res, "3840") == 0) {
+                out_w = 3840;
+                out_h = 1920;
+            } else if (std::strcmp(export_res, "5.7k") == 0 || std::strcmp(export_res, "5760") == 0) {
+                out_w = 5760;
+                out_h = 2880;
+            } else if (std::strcmp(export_res, "8k") == 0 || std::strcmp(export_res, "7680") == 0) {
+                out_w = 7680;
+                out_h = 3840;
+            }
+        }
+    }
 
     // Instantaneous cache hit when user pans/rotates/zooms the 360 viewport on the same frame
     if (position == ctx->cached_position && export_mode == ctx->cached_export_mode &&
         stab_mode == ctx->cached_stab_mode &&
-        ctx->cached_w > 0 && ctx->cached_h > 0 &&
-        ctx->cached_equirect.size() == (size_t)ctx->cached_w * ctx->cached_h * 4) {
-        *width = ctx->cached_w;
-        *height = ctx->cached_h;
+        ctx->cached_w == out_w && ctx->cached_h == out_h &&
+        ctx->cached_equirect.size() == (size_t)out_w * out_h * 4) {
+        *width = out_w;
+        *height = out_h;
         *format = mlt_image_rgba;
-        int buf_size = ctx->cached_w * ctx->cached_h * 4;
+        int buf_size = out_w * out_h * 4;
         *image = (uint8_t*)mlt_pool_alloc(buf_size);
         std::memcpy(*image, ctx->cached_equirect.data(), buf_size);
         mlt_frame_set_image(frame, *image, buf_size, mlt_pool_release);
         return 0;
     }
 
+    // Scaled frame index for gyro telemetry lookup matching container fps
+    double profile_fps = mlt_producer_get_fps(producer);
+    double source_fps = ctx->metadata.fps > 0.0 ? ctx->metadata.fps : 25.0;
+    int64_t source_frame = (profile_fps > 0.0)
+        ? static_cast<int64_t>(position / profile_fps * source_fps + 0.5)
+        : position;
+
+    // Fast-path: Companion .LRF proxy decoding during interactive editor playback
+    // The camera's companion .LRF is 2048x1024 progressive H.264 side-by-side dual fisheye.
+    // Left half (1024x1024) is Slave lens (Stream 0), Right half (1024x1024) is Master lens (Stream 1).
     if (use_lrf) {
         if (!ctx->ensureStitcher()) {
             std::cerr << "[OSV-MLT] Failed to initialize Vulkan stitcher for LRF mode" << std::endl;
             return 1;
         }
 
-        if (ctx->last_lrf_position < 0 || position != ctx->last_lrf_position + 1) {
+        if (cut_changed || ctx->last_lrf_position < 0 || position != ctx->last_lrf_position + 1) {
             mlt_producer_seek(ctx->producer_lrf, position);
         }
         ctx->last_lrf_position = position;
@@ -201,8 +236,6 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
             int lw = 2048;
             int lh = 1024;
             if (mlt_frame_get_image(lrf_frame, &lrf_img, &fmt, &lw, &lh, 0) == 0 && lrf_img) {
-                int out_w = 2048;
-                int out_h = 1024;
                 *width = out_w;
                 *height = out_h;
                 *format = mlt_image_rgba;
@@ -210,7 +243,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
                 *image = (uint8_t*)mlt_pool_alloc(buf_size);
 
                 float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-                ctx->metadata.getStabilizationQuat(position, stab_mode, gyro);
+                ctx->metadata.getStabilizationQuat(source_frame, stab_mode, gyro);
                 bool ok = ctx->stitcher->stitchSideBySide(
                     lrf_img,
                     lw, lh,
@@ -243,13 +276,13 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
         }
     }
 
-    // Full 4K Vulkan compute stitching path (used for final render / export or when no LRF is available)
+    // Full Vulkan compute stitching path (used for final render / export or when no LRF is available)
     if (!ctx->ensureFullProducers()) {
         return 1;
     }
 
-    // Avoid seeking on sequential playback to prevent GOP decoder flush
-    if (ctx->last_position < 0 || position != ctx->last_position + 1) {
+    // Avoid seeking on sequential playback within the same cut to prevent GOP decoder flush
+    if (cut_changed || ctx->last_position < 0 || position != ctx->last_position + 1) {
         mlt_producer_seek(ctx->producer_master, position);
         mlt_producer_seek(ctx->producer_slave, position);
     }
@@ -275,31 +308,6 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     mlt_frame_get_image(frame_master, &img_master, &fmt, &w1, &h1, 0);
     mlt_frame_get_image(frame_slave, &img_slave, &fmt, &w0, &h0, 0);
 
-    // In export mode, the stitched equirectangular frame must maintain 2:1 aspect ratio.
-    // If the caller requested an explicit 2:1 resolution (e.g. equirectangular export project profile),
-    // respect caller's requested dimensions.
-    // Otherwise (e.g. reframing to 16:9 1080p or 4K), default to 5.7K (5760x2880) so downstream reframing
-    // filters (e.g. bigsh0t_eq_to_rect) sample from high-resolution optical sensor data.
-    int out_w = 5760;
-    int out_h = 2880;
-    if (*width > 0 && *height > 0 && *width == 2 * (*height)) {
-        out_w = *width;
-        out_h = *height;
-    }
-    const char* export_res = mlt_properties_get(props, "osv.export_res");
-    if (!export_res) export_res = std::getenv("OSV_EXPORT_RES");
-    if (export_res) {
-        if (std::strcmp(export_res, "4k") == 0 || std::strcmp(export_res, "3840") == 0) {
-            out_w = 3840;
-            out_h = 1920;
-        } else if (std::strcmp(export_res, "5.7k") == 0 || std::strcmp(export_res, "5760") == 0) {
-            out_w = 5760;
-            out_h = 2880;
-        } else if (std::strcmp(export_res, "8k") == 0 || std::strcmp(export_res, "7680") == 0) {
-            out_w = 7680;
-            out_h = 3840;
-        }
-    }
     *width = out_w;
     *height = out_h;
     *format = mlt_image_rgba;
@@ -309,7 +317,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     if (img_master && img_slave && ctx->stitcher_initialized) {
         float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-        ctx->metadata.getStabilizationQuat(position, stab_mode, gyro);
+        ctx->metadata.getStabilizationQuat(source_frame, stab_mode, gyro);
         if (ctx->stitcher->stitchFrames(
             img_master, img_slave,
             w1, h1,
@@ -346,7 +354,15 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
     mlt_position position = mlt_properties_get(MLT_FRAME_PROPERTIES(frame), "original_position")
         ? mlt_frame_original_position(frame)
         : mlt_frame_get_position(frame);
-    if (ctx->last_audio_position < 0 || position != ctx->last_audio_position + 1) {
+
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+
+    void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
+    if (!current_prod) current_prod = producer;
+    bool cut_changed = (current_prod != ctx->last_audio_producer);
+    ctx->last_audio_producer = current_prod;
+
+    if (cut_changed || ctx->last_audio_position < 0 || position != ctx->last_audio_position + 1) {
         mlt_producer_seek(ctx->producer_audio, position);
     }
     ctx->last_audio_position = position;
@@ -385,7 +401,7 @@ static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int in
         // Populate geometry properties on frame so downstream filters receive correct format
         mlt_properties_set_int(frame_props, "width", 3840);
         mlt_properties_set_int(frame_props, "height", 1920);
-        mlt_properties_set_double(frame_props, "aspect_ratio", 2.0);
+        mlt_properties_set_double(frame_props, "aspect_ratio", 1.0);
         mlt_properties_set_int(frame_props, "progressive", 1);
 
         mlt_frame_push_service(*frame, producer);
@@ -449,16 +465,16 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set_int(props, "astream", 0);
     mlt_properties_set_int(props, "mute_on_pause", 0);
 
-    // Inject Equirectangular 2:1 aspect ratio and video properties
+    // Inject Equirectangular aspect ratio (SAR = 1.0 for square pixels) and video properties
     mlt_properties_set_int(props, "width", 3840);
     mlt_properties_set_int(props, "height", 1920);
-    mlt_properties_set_double(props, "aspect_ratio", 2.0);
+    mlt_properties_set_double(props, "aspect_ratio", 1.0);
     mlt_properties_set_int(props, "progressive", 1);
     mlt_properties_set_double(props, "fps", fps);
 
     mlt_properties_set_int(props, "meta.media.width", 3840);
     mlt_properties_set_int(props, "meta.media.height", 1920);
-    mlt_properties_set_double(props, "meta.media.aspect_ratio", 2.0);
+    mlt_properties_set_double(props, "meta.media.aspect_ratio", 1.0);
     mlt_properties_set_int(props, "meta.media.sample_aspect_num", 1);
     mlt_properties_set_int(props, "meta.media.sample_aspect_den", 1);
     mlt_properties_set_int(props, "meta.media.progressive", 1);
@@ -476,7 +492,7 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     mlt_properties_set(props, "meta.media.0.codec.long_name", "DJI Osmo 360 Dual-Fisheye (Vulkan Stitched)");
     mlt_properties_set_int(props, "meta.media.0.codec.width", 3840);
     mlt_properties_set_int(props, "meta.media.0.codec.height", 1920);
-    mlt_properties_set_double(props, "meta.media.0.codec.aspect_ratio", 2.0);
+    mlt_properties_set_double(props, "meta.media.0.codec.aspect_ratio", 1.0);
     mlt_properties_set_double(props, "meta.media.0.codec.frame_rate", fps);
     mlt_properties_set_double(props, "meta.media.0.stream.frame_rate", fps);
     mlt_properties_set(props, "meta.media.0.codec.pix_fmt", "yuv420p");
