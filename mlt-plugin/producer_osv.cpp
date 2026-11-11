@@ -209,6 +209,11 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     std::lock_guard<std::mutex> lock(ctx->mutex);
 
+    double speed = mlt_properties_get_double(MLT_FRAME_PROPERTIES(frame), "_speed");
+    if (ctx->producer_lrf) {
+        mlt_producer_set_speed(ctx->producer_lrf, speed);
+    }
+
     void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
     if (!current_prod) current_prod = producer;
     bool cut_changed = (current_prod != ctx->last_active_producer);
@@ -234,14 +239,10 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     bool use_lrf = false;
     if (!export_mode) {
-        if (preview_mode == PreviewMode::Proxy) {
+        if (preview_mode == PreviewMode::Proxy || preview_mode == PreviewMode::Auto) {
             use_lrf = ctx->has_lrf && ctx->producer_lrf;
         } else if (preview_mode == PreviewMode::Full) {
             use_lrf = false;
-        } else { // PreviewMode::Auto
-            // In auto mode, use companion LRF proxy when present (vastly superior interactive performance)
-            // or if dynamic fallback has triggered due to high render latency
-            use_lrf = (ctx->has_lrf && ctx->producer_lrf) && (ctx->dynamic_fallback_to_lrf || true);
         }
     }
 
@@ -478,7 +479,13 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
     if (max_pos > 0 && position > max_pos) position = max_pos;
     if (position < 0) position = 0;
 
+    double speed = mlt_properties_get_double(MLT_FRAME_PROPERTIES(frame), "_speed");
+
     std::lock_guard<std::mutex> lock(ctx->audio_mutex);
+
+    if (ctx->producer_audio) {
+        mlt_producer_set_speed(ctx->producer_audio, speed);
+    }
 
     void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
     if (!current_prod) current_prod = producer;
@@ -502,8 +509,13 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
         if (*buffer) {
             std::memcpy(*buffer, audio_buf, total_bytes);
             mlt_frame_set_audio(frame, *buffer, *format, total_bytes, mlt_pool_release);
+            mlt_properties frame_props = MLT_FRAME_PROPERTIES(frame);
+            mlt_properties_set_int(frame_props, "audio_frequency", *frequency);
+            mlt_properties_set_int(frame_props, "audio_channels", *channels);
+            mlt_properties_set_int(frame_props, "audio_samples", *samples);
+            mlt_properties_set_int(frame_props, "audio_format", *format);
             const char* layout = mlt_properties_get(MLT_FRAME_PROPERTIES(audio_frame), "channel_layout");
-            mlt_properties_set(MLT_FRAME_PROPERTIES(frame), "channel_layout", layout ? layout : "stereo");
+            mlt_properties_set(frame_props, "channel_layout", layout ? layout : "stereo");
         } else {
             ret = 1;
         }
@@ -528,6 +540,12 @@ static int producer_get_frame(mlt_producer producer, mlt_frame_ptr frame, int in
         mlt_properties_set_int(frame_props, "height", 1920);
         mlt_properties_set_double(frame_props, "aspect_ratio", 1.0);
         mlt_properties_set_int(frame_props, "progressive", 1);
+
+        // Populate audio properties so downstream filters and mix transitions identify format
+        mlt_properties_set_int(frame_props, "audio_frequency", 48000);
+        mlt_properties_set_int(frame_props, "audio_channels", 2);
+        mlt_properties_set_int(frame_props, "audio_samples", 1920);
+        mlt_properties_set(frame_props, "channel_layout", "stereo");
 
         mlt_frame_push_service(*frame, producer);
         mlt_frame_push_get_image(*frame, producer_get_image);
@@ -685,9 +703,10 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile, mlt_service_type 
     const char* pm_name = (init_pm == PreviewMode::Proxy) ? "proxy" : (init_pm == PreviewMode::Full) ? "full" : "auto";
     std::cout << "[OSV-MLT] Initialized preview mode: " << pm_name << " (has_lrf=" << (ctx->has_lrf ? "yes" : "no") << ")" << std::endl;
 
-    // Dedicated audio producer (prefer lightweight LRF container if available, otherwise OSV)
-    const char* audio_source = (ctx->has_lrf && !ctx->lrf_path.empty()) ? ctx->lrf_path.c_str() : filename;
-    int audio_stream_idx = (ctx->has_lrf && !ctx->lrf_path.empty()) ? 1 : 2;
+    // Dedicated audio producer using master OSV container (Stream 2, astream=0)
+    // Avoids LRF container timescale and metadata demux issues
+    const char* audio_source = filename;
+    int audio_stream_idx = 2;
 
     ctx->producer_audio = mlt_factory_producer(profile, "avformat", audio_source);
     if (ctx->producer_audio) {
