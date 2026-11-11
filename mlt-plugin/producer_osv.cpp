@@ -49,6 +49,10 @@ struct ProducerOsvContext {
     mlt_position last_audio_position = -1;
     void* last_active_producer = nullptr;
     void* last_audio_producer = nullptr;
+    mlt_position last_cut_in = -1;
+    mlt_position last_cut_out = -1;
+    mlt_position last_audio_cut_in = -1;
+    mlt_position last_audio_cut_out = -1;
 
     // Dynamic performance monitoring and auto-adaptation
     double avg_frame_time_ms = 0.0;
@@ -216,8 +220,20 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
     if (!current_prod) current_prod = producer;
-    bool cut_changed = (current_prod != ctx->last_active_producer);
+    mlt_position cut_in = mlt_producer_get_in((mlt_producer)current_prod);
+    mlt_position cut_out = mlt_producer_get_out((mlt_producer)current_prod);
+    bool cut_changed = (current_prod != ctx->last_active_producer) ||
+                       (cut_in != ctx->last_cut_in) ||
+                       (cut_out != ctx->last_cut_out);
     ctx->last_active_producer = current_prod;
+    ctx->last_cut_in = cut_in;
+    ctx->last_cut_out = cut_out;
+
+    if (cut_changed) {
+        ctx->cached_position = -1;
+        ctx->last_lrf_position = -1;
+        ctx->last_position = -1;
+    }
 
     // Gyro stabilization mode: 0 = Off, 1 = Horizon Lock (default), 2 = Full Lock
     mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
@@ -267,7 +283,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     }
 
     // Instantaneous cache hit when user pans/rotates/zooms the 360 viewport on the same frame
-    if (position == ctx->cached_position && export_mode == ctx->cached_export_mode &&
+    if (!cut_changed && position == ctx->cached_position && export_mode == ctx->cached_export_mode &&
         stab_mode == ctx->cached_stab_mode &&
         ctx->cached_w == out_w && ctx->cached_h == out_h &&
         ctx->cached_equirect.size() == (size_t)out_w * out_h * 4) {
@@ -489,8 +505,18 @@ static int producer_get_audio(mlt_frame frame, void** buffer, mlt_audio_format* 
 
     void* current_prod = mlt_properties_get_data(MLT_FRAME_PROPERTIES(frame), "_producer", NULL);
     if (!current_prod) current_prod = producer;
-    bool cut_changed = (current_prod != ctx->last_audio_producer);
+    mlt_position cut_in = mlt_producer_get_in((mlt_producer)current_prod);
+    mlt_position cut_out = mlt_producer_get_out((mlt_producer)current_prod);
+    bool cut_changed = (current_prod != ctx->last_audio_producer) ||
+                       (cut_in != ctx->last_audio_cut_in) ||
+                       (cut_out != ctx->last_audio_cut_out);
     ctx->last_audio_producer = current_prod;
+    ctx->last_audio_cut_in = cut_in;
+    ctx->last_audio_cut_out = cut_out;
+
+    if (cut_changed) {
+        ctx->last_audio_position = -1;
+    }
 
     if (cut_changed || ctx->last_audio_position < 0 || position != ctx->last_audio_position + 1) {
         mlt_producer_seek(ctx->producer_audio, position);

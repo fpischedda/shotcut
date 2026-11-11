@@ -83,12 +83,14 @@ public:
 
         int W = static_cast<int>(width);
         int H = static_cast<int>(height);
+        if (W < 2 || H < 2) return;
+
         float y_deg = static_cast<float>(yaw);
         float p_deg = static_cast<float>(pitch);
         float r_deg = static_cast<float>(roll);
         float fov_deg = static_cast<float>(fov);
         float fe = static_cast<float>(fisheye);
-        if (fov_deg <= 0.0f) {
+        if (fov_deg < 0.1f) {
             fov_deg = 90.0f;
         } else if (fov_deg > 179.0f && fe <= 1e-4f) {
             fov_deg = 179.0f;
@@ -96,6 +98,9 @@ public:
 
         Mat3f M = buildRotation(y_deg, p_deg, r_deg);
         float tan_half_fov = std::tan(0.5f * fov_deg * (PI / 180.0f));
+        if (std::isnan(tan_half_fov) || tan_half_fov <= 1e-4f) {
+            tan_half_fov = 1.0f;
+        }
         float half_w = static_cast<float>(W >> 1);
         float half_h = static_cast<float>(H >> 1);
         float step_x = tan_half_fov / half_w;
@@ -125,21 +130,25 @@ public:
                     float wx = wx0 + x * dwx;
                     float wy = wy0 + x * dwy;
                     float wz = wz0 + x * dwz;
+                    float len_xy = std::sqrt(wx * wx + wy * wy);
                     float lon = fast_atan2f(wy, wx);
-                    float lat = fast_atan2f(wz, std::sqrt(wx * wx + wy * wy));
+                    float lat = fast_atan2f(wz, (len_xy > 1e-6f) ? len_xy : 1e-6f);
                     float u = lon * scale_u + half_w;
                     float v = lat * scale_v + half_h;
-                    if (u < 0.0f) u += fW;
-                    else if (u >= fW) u -= fW;
+
+                    if (std::isnan(u) || std::isnan(v)) {
+                        row[x] = {-1, 0, 0};
+                        continue;
+                    }
+                    while (u < 0.0f) u += fW;
+                    while (u >= fW) u -= fW;
                     if (v < 0.0f) v = 0.0f;
                     else if (v > max_v) v = max_v;
 
-                    int u0 = static_cast<int>(u);
-                    int v0 = static_cast<int>(v);
+                    int u0 = std::clamp(static_cast<int>(u), 0, W - 2);
+                    int v0 = std::clamp(static_cast<int>(v), 0, H - 2);
                     int fx = static_cast<int>((u - u0) * 256.0f);
                     int fy = static_cast<int>((v - v0) * 256.0f);
-                    if (u0 >= W - 1) u0 = W - 2;
-                    if (v0 >= H - 1) v0 = H - 2;
                     row[x] = {v0 * W + u0, static_cast<uint16_t>(fx), static_cast<uint16_t>(fy)};
                 }
             }
@@ -181,21 +190,25 @@ public:
                     float wy = M.m[1][0] * vx + M.m[1][1] * vy + M.m[1][2] * vz_tot;
                     float wz = M.m[2][0] * vx + M.m[2][1] * vy + M.m[2][2] * vz_tot;
 
+                    float len_xy = std::sqrt(wx * wx + wy * wy);
                     float lon = fast_atan2f(wy, wx);
-                    float lat = fast_atan2f(wz, std::sqrt(wx * wx + wy * wy));
+                    float lat = fast_atan2f(wz, (len_xy > 1e-6f) ? len_xy : 1e-6f);
                     float u = lon * scale_u + half_w;
                     float v = lat * scale_v + half_h;
-                    if (u < 0.0f) u += fW;
-                    else if (u >= fW) u -= fW;
+
+                    if (std::isnan(u) || std::isnan(v)) {
+                        row[x] = {-1, 0, 0};
+                        continue;
+                    }
+                    while (u < 0.0f) u += fW;
+                    while (u >= fW) u -= fW;
                     if (v < 0.0f) v = 0.0f;
                     else if (v > max_v) v = max_v;
 
-                    int u0 = static_cast<int>(u);
-                    int v0 = static_cast<int>(v);
+                    int u0 = std::clamp(static_cast<int>(u), 0, W - 2);
+                    int v0 = std::clamp(static_cast<int>(v), 0, H - 2);
                     int fx = static_cast<int>((u - u0) * 256.0f);
                     int fy = static_cast<int>((v - v0) * 256.0f);
-                    if (u0 >= W - 1) u0 = W - 2;
-                    if (v0 >= H - 1) v0 = H - 2;
                     row[x] = {v0 * W + u0, static_cast<uint16_t>(fx), static_cast<uint16_t>(fy)};
                 }
             }
@@ -205,6 +218,7 @@ public:
     }
 
     void process(const uint32_t* __restrict__ inframe, uint32_t* __restrict__ outframe) {
+        if (!inframe || !outframe || width < 2 || height < 2) return;
         updateMap();
 
         int total = static_cast<int>(width * height);
@@ -215,16 +229,17 @@ public:
             #pragma omp parallel for schedule(static)
             for (int i = 0; i < total; ++i) {
                 int32_t off = m[i].offset;
-                outframe[i] = (off >= 0) ? inframe[off] : 0xFF000000u;
+                outframe[i] = (off >= 0 && off < total) ? inframe[off] : 0xFF000000u;
             }
         } else {
             // High quality fast bilinear interpolation
             int stride = static_cast<int>(width);
+            int max_idx = total - stride - 2;
             #pragma omp parallel for schedule(static)
             for (int i = 0; i < total; ++i) {
                 int32_t off = m[i].offset;
-                if (__builtin_expect(off < 0, 0)) {
-                    outframe[i] = 0xFF000000u;
+                if (__builtin_expect(off < 0 || off > max_idx, 0)) {
+                    outframe[i] = (off >= 0 && off < total) ? inframe[off] : 0xFF000000u;
                     continue;
                 }
                 uint32_t fx = m[i].fx;
@@ -319,26 +334,36 @@ void f0r_destruct(f0r_instance_t instance) {
 }
 
 void f0r_set_param_value(f0r_instance_t instance, f0r_param_t param, int param_index) {
+    if (!instance || !param) return;
     auto* inst = static_cast<EqToRectInstance*>(instance);
     double val = *static_cast<const double*>(param);
     switch (param_index) {
         case 0:
+            if (std::isnan(val)) val = 0.0;
             if (inst->yaw != val) { inst->yaw = val; inst->dirty = true; }
             break;
         case 1:
+            if (std::isnan(val)) val = 0.0;
             if (inst->pitch != val) { inst->pitch = val; inst->dirty = true; }
             break;
         case 2:
+            if (std::isnan(val)) val = 0.0;
             if (inst->roll != val) { inst->roll = val; inst->dirty = true; }
             break;
         case 3:
-            if (val <= 0.0) val = 90.0;
+            // Guard against UI reset / 0 fov: retain current fov or default to 90.0
+            if (std::isnan(val) || val < 0.1) {
+                val = (inst->fov >= 0.1) ? inst->fov : 90.0;
+            }
             if (inst->fov != val) { inst->fov = val; inst->dirty = true; }
             break;
         case 4:
+            if (std::isnan(val) || val < 0.0) val = 0.0;
+            if (val > 100.0) val = 100.0;
             if (inst->fisheye != val) { inst->fisheye = val; inst->dirty = true; }
             break;
         case 5:
+            if (std::isnan(val) || val < 0.0) val = 1.0;
             if (inst->interpolation != val) { inst->interpolation = val; }
             break;
         default:
