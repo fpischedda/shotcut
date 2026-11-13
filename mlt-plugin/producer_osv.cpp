@@ -10,6 +10,7 @@ extern "C" {
 #include <cstring>
 #include <string>
 #include <filesystem>
+#include <fstream>
 #include <mutex>
 #include <chrono>
 
@@ -41,6 +42,7 @@ struct ProducerOsvContext {
     int cached_w = 0;
     int cached_h = 0;
     bool cached_export_mode = false;
+    bool cached_use_lrf = false;
     int cached_stab_mode = -1;
     std::vector<uint8_t> cached_equirect;
 
@@ -126,7 +128,7 @@ struct ProducerOsvContext {
     }
 };
 
-static bool is_render_export(mlt_producer producer) {
+static bool is_render_export(mlt_producer producer, mlt_frame frame) {
     mlt_properties props = MLT_PRODUCER_PROPERTIES(producer);
 
     // 1. Explicit property override on producer (osv_mode)
@@ -143,25 +145,70 @@ static bool is_render_export(mlt_producer producer) {
         if (std::strcmp(env_mode, "proxy") == 0 || std::strcmp(env_mode, "lrf") == 0 || std::strcmp(env_mode, "preview") == 0) return false;
     }
 
-    // 3. Process detection:
-    // When Shotcut exports, it spawns 'melt' / 'melt-7' to encode the timeline.
-    // Inside the Shotcut GUI itself, it runs the interactive editor preview.
-    try {
-        std::string exe = std::filesystem::read_symlink("/proc/self/exe").filename().string();
-        if (exe.find("melt") != std::string::npos) {
-            return true;
+    // 3. Inspect consumer attached to frame if available
+    if (frame) {
+        mlt_properties frame_props = MLT_FRAME_PROPERTIES(frame);
+        mlt_consumer cons = (mlt_consumer) mlt_properties_get_data(frame_props, "consumer", nullptr);
+        if (cons) {
+            mlt_properties cp = MLT_CONSUMER_PROPERTIES(cons);
+            const char *svc = mlt_properties_get(cp, "mlt_service");
+            if (svc
+                && (std::strcmp(svc, "avformat") == 0
+                    || std::strcmp(svc, "avformat-novalidate") == 0)) {
+                return true;
+            }
+            if (mlt_properties_get(cp, "real_time") != nullptr
+                && mlt_properties_get_int(cp, "real_time") <= 0) {
+                return true;
+            }
         }
-    } catch (...) {}
-
-    // 4. Consumer service check if directly connected
-    mlt_service cons = mlt_service_consumer(MLT_PRODUCER_SERVICE(producer));
-    if (cons) {
-        mlt_properties cp = MLT_SERVICE_PROPERTIES(cons);
-        const char* svc = mlt_properties_get(cp, "mlt_service");
-        if (svc && (std::strcmp(svc, "avformat") == 0 || std::strcmp(svc, "avformat-novalidate") == 0)) {
+        if (mlt_properties_get_int(frame_props, "rendered") == 1) {
             return true;
         }
     }
+
+    // 4. Traverse consumer chain from producer output service
+    mlt_service svc = MLT_PRODUCER_SERVICE(producer);
+    int depth = 0;
+    while (svc && depth++ < 15) {
+        if (mlt_service_identify(svc) == mlt_service_consumer_type) {
+            mlt_properties cp = MLT_SERVICE_PROPERTIES(svc);
+            const char *s = mlt_properties_get(cp, "mlt_service");
+            if (s
+                && (std::strcmp(s, "avformat") == 0 || std::strcmp(s, "avformat-novalidate") == 0)) {
+                return true;
+            }
+            if (mlt_properties_get(cp, "real_time") != nullptr
+                && mlt_properties_get_int(cp, "real_time") <= 0) {
+                return true;
+            }
+            break;
+        }
+        svc = mlt_service_consumer(svc);
+    }
+
+    // 5. Process detection:
+    // When Shotcut exports, it spawns 'melt' / 'melt-7' to encode the timeline.
+    try {
+        std::ifstream cmdline("/proc/self/cmdline", std::ios::binary);
+        if (cmdline.is_open()) {
+            std::string arg;
+            bool is_melt = false;
+            bool is_export_job = false;
+            while (std::getline(cmdline, arg, '\0')) {
+                if (arg.find("melt") != std::string::npos) {
+                    is_melt = true;
+                }
+                if (arg.rfind("xml:", 0) == 0 || arg.find("avformat") != std::string::npos
+                    || arg.rfind("consumer:", 0) == 0 || arg == "-abort") {
+                    is_export_job = true;
+                }
+            }
+            if (is_melt && is_export_job) {
+                return true;
+            }
+        }
+    } catch (...) {}
 
     return false;
 }
@@ -250,15 +297,32 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
     }
 
     // Determine preview vs export mode and target stitch dimensions
-    bool export_mode = is_render_export(producer);
+    bool export_mode = is_render_export(producer, frame);
     PreviewMode preview_mode = resolve_preview_mode(producer);
 
     bool use_lrf = false;
-    if (!export_mode) {
-        if (preview_mode == PreviewMode::Proxy || preview_mode == PreviewMode::Auto) {
+    if (export_mode) {
+        // EXPORT / RENDER: Always stitch full Dual-4K/5.7K HEVC streams with Vulkan for maximum fidelity.
+        // The ONLY exception is if the user explicitly forced proxy export via osv_mode=proxy or OSV_MODE=proxy.
+        const char *prop_mode = mlt_properties_get(props, "osv_mode");
+        const char *env_mode = std::getenv("OSV_MODE");
+        if ((prop_mode
+             && (std::strcmp(prop_mode, "proxy") == 0 || std::strcmp(prop_mode, "lrf") == 0))
+            || (env_mode
+                && (std::strcmp(env_mode, "proxy") == 0 || std::strcmp(env_mode, "lrf") == 0))) {
             use_lrf = ctx->has_lrf && ctx->producer_lrf;
-        } else if (preview_mode == PreviewMode::Full) {
+        } else {
             use_lrf = false;
+        }
+    } else {
+        // PREVIEW / EDITING:
+        // Use LRF companion proxy by default (Auto) or when Proxy mode is requested,
+        // providing fluid, real-time playback and scrubbing without dropping frames.
+        if (preview_mode == PreviewMode::Full) {
+            use_lrf = false;
+        } else {
+            // Both Auto (default) and Proxy modes use LRF companion if available
+            use_lrf = ctx->has_lrf && ctx->producer_lrf;
         }
     }
 
@@ -284,6 +348,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
 
     // Instantaneous cache hit when user pans/rotates/zooms the 360 viewport on the same frame
     if (!cut_changed && position == ctx->cached_position && export_mode == ctx->cached_export_mode &&
+        use_lrf == ctx->cached_use_lrf &&
         stab_mode == ctx->cached_stab_mode &&
         ctx->cached_w == out_w && ctx->cached_h == out_h &&
         ctx->cached_equirect.size() == (size_t)out_w * out_h * 4) {
@@ -353,6 +418,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
                     ctx->cached_w = out_w;
                     ctx->cached_h = out_h;
                     ctx->cached_export_mode = export_mode;
+                    ctx->cached_use_lrf = use_lrf;
                     ctx->cached_stab_mode = stab_mode;
                     ctx->cached_equirect.assign(*image, *image + buf_size);
 
@@ -439,6 +505,7 @@ static int producer_get_image(mlt_frame frame, uint8_t** image, mlt_image_format
             ctx->cached_w = out_w;
             ctx->cached_h = out_h;
             ctx->cached_export_mode = export_mode;
+            ctx->cached_use_lrf = use_lrf;
             ctx->cached_stab_mode = stab_mode;
             ctx->cached_equirect.assign(*image, *image + buf_size);
         }
