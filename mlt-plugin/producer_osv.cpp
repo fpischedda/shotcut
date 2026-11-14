@@ -432,6 +432,7 @@ static int producer_get_image(mlt_frame frame,
 
         if (cut_changed || ctx->last_lrf_position < 0 || position != ctx->last_lrf_position + 1) {
             mlt_producer_seek(ctx->producer_lrf, position);
+            ctx->stitcher->resetTemporalSeam();
         }
         ctx->last_lrf_position = position;
 
@@ -448,6 +449,15 @@ static int producer_get_image(mlt_frame frame,
                 *format = mlt_image_rgba;
                 int buf_size = out_w * out_h * 4;
                 *image = (uint8_t *) mlt_pool_alloc(buf_size);
+
+                double stitch_radius = mlt_properties_get_double(MLT_PRODUCER_PROPERTIES(producer), "stitch_radius");
+                if (stitch_radius <= 0.0) {
+                    const char *env_radius = std::getenv("OSV_STITCH_RADIUS");
+                    if (env_radius) {
+                        stitch_radius = std::atof(env_radius);
+                    }
+                }
+                ctx->stitcher->setStitchRadius((float) stitch_radius);
 
                 float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
                 ctx->metadata.getStabilizationQuat(source_frame, stab_mode, gyro);
@@ -505,6 +515,7 @@ static int producer_get_image(mlt_frame frame,
     if (cut_changed || ctx->last_position < 0 || position != ctx->last_position + 1) {
         mlt_producer_seek(ctx->producer_master, position);
         mlt_producer_seek(ctx->producer_slave, position);
+        ctx->stitcher->resetTemporalSeam();
     }
     ctx->last_position = position;
 
@@ -548,6 +559,15 @@ static int producer_get_image(mlt_frame frame,
     *image = (uint8_t *) mlt_pool_alloc(buf_size);
 
     if (img_master && img_slave && ctx->stitcher_initialized) {
+        double stitch_radius = mlt_properties_get_double(MLT_PRODUCER_PROPERTIES(producer), "stitch_radius");
+        if (stitch_radius <= 0.0) {
+            const char *env_radius = std::getenv("OSV_STITCH_RADIUS");
+            if (env_radius) {
+                stitch_radius = std::atof(env_radius);
+            }
+        }
+        ctx->stitcher->setStitchRadius((float) stitch_radius);
+
         float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
         ctx->metadata.getStabilizationQuat(source_frame, stab_mode, gyro);
         if (ctx->stitcher->stitchFrames(img_master,

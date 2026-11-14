@@ -221,8 +221,8 @@ void main()
 
         // 3. High-frequency seam sharpening: adapt transition width based on local texture disparity
         float colorDiff = length(colorMaster.rgb - colorSlave.rgb);
-        float mismatch = smoothstep(0.06, 0.25, colorDiff);
-        float effectiveHalf = mix(blendHalf, radians(0.6), mismatch);
+        float mismatch = smoothstep(0.05, 0.20, colorDiff);
+        float effectiveHalf = mix(blendHalf, radians(0.25), mismatch);
         float adaptiveBlend = smoothstep(phiCut - effectiveHalf, phiCut + effectiveHalf, phiSeam);
         finalColor = vec4(clamp(mix(balancedSlave, balancedMaster, adaptiveBlend), 0.0, 1.0), 1.0);
     } else if (validMaster) {

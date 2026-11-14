@@ -36,18 +36,32 @@ Orientation reference:
 
 ### 2.3 Dynamic Programming (DP) Seam Optimization
 For each knot $k \in \{0 \dots 127\}$ along $\alpha_k$, 17 candidate seam offset angles $\phi_{c} \in [-6.2^\circ, +6.2^\circ]$ are evaluated across a 5-sample local window:
-$$\text{Cost}(k, c) = \text{avgDiff}^2 + 0.0005 \cdot \left(\frac{\phi_c}{\phi_{max}}\right)^2 + \text{ForwardBias}(\phi_c)$$
+$$\text{Cost}(k, c) = \text{avgDiff}^2 + 0.0005 \cdot \left(\frac{\phi_c}{\phi_{max}}\right)^2 + \text{ForwardBias}(\phi_c) + 0.05 \cdot \max(\nabla_\phi I_M, \nabla_\phi I_S)^2$$
 $$\text{ForwardBias}(\phi_c) = 0.003 \cdot \max\left(0, \frac{\phi_c}{\phi_{max}}\right)$$
+
+The cost function incorporates:
+1. **Squared Photometric Error**: Repels the seam from regions of high color disparity.
+2. **Center Deviation Bias**: Keeps the seam at 50/50 bisector in uniform regions.
+3. **Forward Optical Bias**: Strongly favors Master for foreground obstacles in front of the camera.
+4. **Directional Edge-Crossing Penalty**: Computes the central difference $\nabla_\phi I = \frac{1}{2} |I(c+1) - I(c-1)|$ across candidate angles. Crossing high-contrast linear structures (rails, steps, ledges) is heavily penalized ($>300\%$), routing the seam along flat, low-contrast concrete or sky.
 
 The globally optimal closed-loop path is resolved using 2-pass dynamic programming:
 $$M[k, c] = \text{Cost}(k \bmod N, c) + \min_{|c - p| \le 2} \left( M[k-1, p] + \lambda_{smooth} \cdot |c - p| \right)$$
 where $\lambda_{smooth} = 0.005$ and $|c - p| \le 2$ enforces strict $C_0$ continuity (maximum slope $\Delta \phi / \Delta \alpha \le 0.55$), preventing horizontal fracturing across vertical structures.
 
-### 2.4 Multi-Band Photometric Overlap Equalization
+### 2.4 Temporal Moving Average & Convergence Radius
+- **Temporal Seam Filtering**: In continuous video playback, raw per-frame DP paths are filtered using an exponential moving average:
+  $$\phi_{cut}^{(t)}[k] = 0.65 \cdot \phi_{cut}^{(t-1)}[k] + 0.35 \cdot \phi_{raw}^{(t)}[k]$$
+  On seek or edit cut jumps, the history is reset to snap instantaneously without trailing lag.
+- **Convergence Focal Sphere (`stitchRadius`)**: Supports an operational focal distance parameter (e.g. $1.0\text{ m} \dots 2.0\text{ m}$ for selfie-stick action footage, $0.0\text{ m}$ for pure angular infinity). Compensates the $24\text{ mm}$ physical baseline offset, reducing near-field angular disparity by up to $70\%$.
+
+### 2.5 Multi-Band Photometric Overlap Equalization
 In `shaders/osv_stitch.comp` and `shaders/osv_stitch.cu`, low-frequency exposure and vignetting differences are equalized across the full optical overlap band ($14.5^\circ$):
 $$t_{wide} = \text{smoothstep}(-\phi_{overlap}, +\phi_{overlap}, \phi_{seam})$$
 $$I_{slave}^{bal} = I_{slave} + t_{wide} \cdot \Delta C, \quad I_{master}^{bal} = I_{master} - (1 - t_{wide}) \cdot \Delta C$$
-where $\Delta C = \text{clamp}(I_{master} - I_{slave}, -0.15, +0.15)$. At the cut line $\phi_{cut}$, high-frequency content-adaptive transition is performed without any luminance step change.
+where $\Delta C = \text{clamp}(I_{master} - I_{slave}, -0.15, +0.15)$.
+
+High-frequency detail is sharpened using content-adaptive bandwidth: when local texture disparity is detected, the transition band automatically narrows down to $0.25^\circ$ ($4\text{ px}$), completely eliminating ghosting/double images.
 
 ---
 

@@ -28,6 +28,10 @@ public:
     bool initialize(const std::string& spv_shader_path);
     void cleanup();
 
+    void setStitchRadius(float radius_meters) { stitchRadius_ = radius_meters; }
+    float getStitchRadius() const { return stitchRadius_; }
+    void resetTemporalSeam() { has_prev_seam_ = false; }
+
     bool stitchFrames(
         const uint8_t* master_rgba,
         const uint8_t* slave_rgba,
@@ -104,6 +108,10 @@ private:
     VkDescriptorSet descSet_ = VK_NULL_HANDLE;
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
+
+    float stitchRadius_ = 0.0f;
+    bool has_prev_seam_ = false;
+    float prev_seam_phis_[128] = {0.0f};
 
     void computeSeamLut(
         const uint8_t* master_rgba,

@@ -232,8 +232,8 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
         float dy = colorMaster.y - colorSlave.y;
         float dz = colorMaster.z - colorSlave.z;
         float colorDiff = sqrtf(dx * dx + dy * dy + dz * dz);
-        float mismatch = smoothstep(0.06f, 0.25f, colorDiff);
-        float minHalf = 0.6f * deg2rad;
+        float mismatch = smoothstep(0.05f, 0.20f, colorDiff);
+        float minHalf = 0.25f * deg2rad;
         float effectiveHalf = blendHalf + mismatch * (minHalf - blendHalf);
         float adaptiveBlend = smoothstep(phiCut - effectiveHalf, phiCut + effectiveHalf, phiSeam);
 

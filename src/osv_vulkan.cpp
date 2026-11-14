@@ -718,15 +718,18 @@ void OsvVulkanStitcher::computeSeamLut(
     const int N_CAND = 17;
     const float maxSearch = 6.2f * (3.14159265f / 180.0f);
     float costs[N_KNOTS][N_CAND];
+    float lumaM[N_KNOTS][N_CAND];
+    float lumaS[N_KNOTS][N_CAND];
+    float diffs[N_KNOTS][N_CAND];
+    bool validKnot[N_KNOTS][N_CAND];
 
     #pragma omp parallel for schedule(static)
     for (int k = 0; k < N_KNOTS; ++k) {
         float aK = -3.141592653589793f + float(k) * (2.0f * 3.141592653589793f / float(N_KNOTS));
         for (int c = 0; c < N_CAND; ++c) {
             float candPhi = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
-            float diffAccum = 0.0f, edgeAccum = 0.0f;
+            float diffAccum = 0.0f, mAccum = 0.0f, sAccum = 0.0f;
             int validCount = 0;
-            float prevM = 0.0f, prevS = 0.0f;
             for (int j = -2; j <= 2; ++j) {
                 float aSub = aK + float(j) * (0.75f * 3.14159265f / 180.0f);
                 Vec3f dSub = uSeam * std::cos(aSub) + vSeam * std::sin(aSub);
@@ -739,21 +742,53 @@ void OsvVulkanStitcher::computeSeamLut(
                     float cM = sampleLuma(master_rgba, master_stride, px_m, py_m);
                     float cS = sampleLuma(slave_rgba, slave_stride, px_s, py_s);
                     diffAccum += std::abs(cM - cS);
-                    if (validCount > 0) edgeAccum += std::abs(cM - prevM) + std::abs(cS - prevS);
-                    prevM = cM;
-                    prevS = cS;
+                    mAccum += cM;
+                    sAccum += cS;
                     validCount++;
                 }
             }
             if (validCount > 2) {
-                float avgDiff = diffAccum / float(validCount);
-                float normPhi = candPhi / maxSearch;
-                // Penalize squared photometric difference + forward optical bias keeping Master for front obstacles
-                float forwardBias = 0.003f * std::max(0.0f, normPhi);
-                costs[k][c] = avgDiff * avgDiff + 0.0005f * normPhi * normPhi + forwardBias;
+                diffs[k][c] = diffAccum / float(validCount);
+                lumaM[k][c] = mAccum / float(validCount);
+                lumaS[k][c] = sAccum / float(validCount);
+                validKnot[k][c] = true;
             } else {
-                costs[k][c] = 1e6f;
+                diffs[k][c] = 1e6f;
+                lumaM[k][c] = 0.0f;
+                lumaS[k][c] = 0.0f;
+                validKnot[k][c] = false;
             }
+        }
+
+        // Calculate gradient across candidate angles to heavily penalize crossing sharp edges
+        for (int c = 0; c < N_CAND; ++c) {
+            if (!validKnot[k][c]) {
+                costs[k][c] = 1e6f;
+                continue;
+            }
+            float gradM = 0.0f, gradS = 0.0f;
+            if (c > 0 && c < N_CAND - 1) {
+                gradM = std::abs(lumaM[k][c + 1] - lumaM[k][c - 1]) * 0.5f;
+                gradS = std::abs(lumaS[k][c + 1] - lumaS[k][c - 1]) * 0.5f;
+            } else if (c == 0) {
+                gradM = std::abs(lumaM[k][1] - lumaM[k][0]);
+                gradS = std::abs(lumaS[k][1] - lumaS[k][0]);
+            } else {
+                gradM = std::abs(lumaM[k][N_CAND - 1] - lumaM[k][N_CAND - 2]);
+                gradS = std::abs(lumaS[k][N_CAND - 1] - lumaS[k][N_CAND - 2]);
+            }
+            float edgePenalty = std::max(gradM, gradS);
+
+            float avgDiff = diffs[k][c];
+            float candPhi = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
+            float normPhi = candPhi / maxSearch;
+            // Penalize:
+            // 1. Squared photometric disparity (edges / high error)
+            // 2. Center deviation (gentle preference for 50/50 split when scene is uniform)
+            // 3. Forward optical bias (strongly favor Master for obstacles in forward hemisphere)
+            // 4. Directional edge-crossing penalty (repel seam from cutting across sharp contrast lines)
+            float forwardBias = 0.003f * std::max(0.0f, normPhi);
+            costs[k][c] = avgDiff * avgDiff + 0.0005f * normPhi * normPhi + forwardBias + 0.05f * edgePenalty * edgePenalty;
         }
     }
 
@@ -797,10 +832,18 @@ void OsvVulkanStitcher::computeSeamLut(
         path[k] = backtrack[k + 1][path[k + 1]];
     }
 
+    // Resolve knots with temporal moving average to prevent video frame-to-frame seam jitter
     for (int k = 0; k < N_KNOTS; ++k) {
         int c = path[N_KNOTS + k];
-        out_phis[k] = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
+        float raw_phi = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
+        if (has_prev_seam_) {
+            out_phis[k] = 0.65f * prev_seam_phis_[k] + 0.35f * raw_phi;
+        } else {
+            out_phis[k] = raw_phi;
+        }
+        prev_seam_phis_[k] = out_phis[k];
     }
+    has_prev_seam_ = true;
 }
 
 bool OsvVulkanStitcher::stitchFrames(const uint8_t *master_rgba,
@@ -1045,7 +1088,7 @@ bool OsvVulkanStitcher::executeStitchPass(uint32_t sensor_w,
     }
 
     pc.packedDims = (out_w & 0xFFFFu) | ((out_h & 0xFFFFu) << 16u);
-    pc.stitchRadius = 0.0f; // pure angular projection to preserve straight architectural lines
+    pc.stitchRadius = stitchRadius_;
     pc.maxFovDegrees = 195.18f;
     pc.blendOverlapDegrees = 14.5f; // full optical overlap band
 

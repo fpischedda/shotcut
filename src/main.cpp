@@ -204,6 +204,11 @@ int main(int argc, char** argv) {
     uint32_t out_h = 1920;
     std::vector<uint8_t> out_equirect(out_w * out_h * 4);
 
+    const char* env_radius = std::getenv("OSV_STITCH_RADIUS");
+    if (env_radius) {
+        stitcher.setStitchRadius(std::atof(env_radius));
+    }
+
     std::cout << "[Vulkan] Executing GPU compute stitch (" << out_w << "x" << out_h << ")..." << std::endl;
     float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
     int frame_idx = (int)(seek_sec * 25.0);
