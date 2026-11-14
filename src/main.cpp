@@ -28,7 +28,7 @@ static void writePPM(const std::string& path, int width, int height, const uint8
     std::cout << "[OSV] Saved stitched frame to: " << path << std::endl;
 }
 
-static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, int frame_target, std::vector<uint8_t>& out_rgba, int& width, int& height) {
+static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, double seek_sec, std::vector<uint8_t>& out_rgba, int& width, int& height) {
     AVStream* stream = fmt_ctx->streams[stream_idx];
     const AVCodec* codec = avcodec_find_decoder(stream->codecpar->codec_id);
     if (!codec) return false;
@@ -38,6 +38,12 @@ static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, int frame_targ
     if (avcodec_open2(c_ctx, codec, nullptr) < 0) {
         avcodec_free_context(&c_ctx);
         return false;
+    }
+
+    if (seek_sec > 0.0) {
+        int64_t ts = (int64_t)(seek_sec * AV_TIME_BASE);
+        av_seek_frame(fmt_ctx, -1, ts, AVSEEK_FLAG_BACKWARD);
+        avcodec_flush_buffers(c_ctx);
     }
 
     AVPacket* pkt = av_packet_alloc();
@@ -56,20 +62,22 @@ static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, int frame_targ
         SWS_FAST_BILINEAR, nullptr, nullptr, nullptr
     );
 
-    int cur_frame = 0;
     bool got_frame = false;
 
     while (av_read_frame(fmt_ctx, pkt) >= 0) {
         if (pkt->stream_index == stream_idx) {
             if (avcodec_send_packet(c_ctx, pkt) == 0) {
                 while (avcodec_receive_frame(c_ctx, frame) == 0) {
-                    sws_scale(sws, frame->data, frame->linesize, 0, height, frame_rgb->data, frame_rgb->linesize);
-                    for (int y = 0; y < height; ++y) {
-                        std::memcpy(&out_rgba[y * width * 4], frame_rgb->data[0] + y * frame_rgb->linesize[0], width * 4);
+                    double pts_sec = frame->pts * av_q2d(stream->time_base);
+                    if (pts_sec >= seek_sec - 0.05) {
+                        sws_scale(sws, frame->data, frame->linesize, 0, height, frame_rgb->data, frame_rgb->linesize);
+                        for (int y = 0; y < height; ++y) {
+                            std::memcpy(&out_rgba[y * width * 4], frame_rgb->data[0] + y * frame_rgb->linesize[0], width * 4);
+                        }
+                        got_frame = true;
+                        av_packet_unref(pkt);
+                        break;
                     }
-                    got_frame = true;
-                    av_packet_unref(pkt);
-                    break;
                 }
             }
         }
@@ -135,11 +143,22 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> frameSlave, frameMaster;
     int w0 = 0, h0 = 0, w1 = 0, h1 = 0;
 
-    std::cout << "[Decode] Decoding Slave Lens (Stream 0)..." << std::endl;
-    decodeFrame(fmt_ctx, 0, 0, frameSlave, w0, h0);
+    double seek_sec = 0.0;
+    if (argc > 2) {
+        seek_sec = std::stod(argv[2]);
+    }
 
-    std::cout << "[Decode] Decoding Master Lens (Stream 1)..." << std::endl;
-    decodeFrame(fmt_ctx, 1, 0, frameMaster, w1, h1);
+    std::cout << "[Decode] Decoding Slave Lens (Stream 0) at " << seek_sec << "s..." << std::endl;
+    decodeFrame(fmt_ctx, 0, seek_sec, frameSlave, w0, h0);
+
+    // Reopen context for stream 1 seek
+    avformat_close_input(&fmt_ctx);
+    fmt_ctx = nullptr;
+    avformat_open_input(&fmt_ctx, osv_path.c_str(), nullptr, nullptr);
+    avformat_find_stream_info(fmt_ctx, nullptr);
+
+    std::cout << "[Decode] Decoding Master Lens (Stream 1) at " << seek_sec << "s..." << std::endl;
+    decodeFrame(fmt_ctx, 1, seek_sec, frameMaster, w1, h1);
 
     avformat_close_input(&fmt_ctx);
 
@@ -186,7 +205,9 @@ int main(int argc, char** argv) {
     std::vector<uint8_t> out_equirect(out_w * out_h * 4);
 
     std::cout << "[Vulkan] Executing GPU compute stitch (" << out_w << "x" << out_h << ")..." << std::endl;
-    float default_gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
+    float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f}; // Identity (w, x, y, z)
+    int frame_idx = (int)(seek_sec * 25.0);
+    meta.getStabilizationQuat(frame_idx, 1, gyro);
 
     bool ok = stitcher.stitchFrames(
         frameMaster.data(),
@@ -195,7 +216,7 @@ int main(int argc, char** argv) {
         h1,
         meta.lens_rear,  // Master (Lens 2)
         meta.lens_front, // Slave (Lens 1)
-        default_gyro,
+        gyro,
         out_w,
         out_h,
         out_equirect.data()
@@ -204,8 +225,8 @@ int main(int argc, char** argv) {
     if (ok) {
         std::cout << "[Vulkan] Stitching completed successfully!" << std::endl;
         std::string out_ppm = "stitched_vulkan_preview.ppm";
-        if (argc > 2) {
-            out_ppm = argv[2];
+        if (argc > 3) {
+            out_ppm = argv[3];
         }
         writePPM(out_ppm, out_w, out_h, out_equirect.data());
     } else {

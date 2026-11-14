@@ -18,6 +18,8 @@ pkg_check_modules(MLT REQUIRED IMPORTED_TARGET
     mlt-framework-7
 )
 
+find_package(OpenMP)
+
 # Vulkan setup: use third_party headers + system libvulkan.so
 set(VULKAN_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/Vulkan-Headers/include)
 find_library(VULKAN_LIB vulkan REQUIRED)
@@ -52,6 +54,9 @@ target_link_libraries(osv_core PUBLIC
     ${VULKAN_LIB}
     PkgConfig::FFMPEG
 )
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(osv_core PUBLIC OpenMP::OpenMP_CXX)
+endif()
 
 # CLI Tool
 add_executable(osv_stitch

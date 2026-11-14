@@ -3,6 +3,8 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <cmath>
+#include <algorithm>
 
 static uint32_t findMemoryType(VkPhysicalDevice physicalDevice,
                                uint32_t typeFilter,
@@ -191,7 +193,8 @@ bool OsvVulkanStitcher::createPipeline(const std::string &spv_path)
     // Binding 0: storage image (output equirectangular)
     // Binding 1: combined image sampler (master lens)
     // Binding 2: combined image sampler (slave lens)
-    VkDescriptorSetLayoutBinding bindings[3]{};
+    // Binding 3: combined image sampler (128x1 DP seam LUT)
+    VkDescriptorSetLayoutBinding bindings[4]{};
     bindings[0].binding = 0;
     bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     bindings[0].descriptorCount = 1;
@@ -207,9 +210,14 @@ bool OsvVulkanStitcher::createPipeline(const std::string &spv_path)
     bindings[2].descriptorCount = 1;
     bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
 
+    bindings[3].binding = 3;
+    bindings[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    bindings[3].descriptorCount = 1;
+    bindings[3].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+
     VkDescriptorSetLayoutCreateInfo layoutInfo{};
     layoutInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
-    layoutInfo.bindingCount = 3;
+    layoutInfo.bindingCount = 4;
     layoutInfo.pBindings = bindings;
 
     if (vkCreateDescriptorSetLayout(device_, &layoutInfo, nullptr, &desc_layout_) != VK_SUCCESS) {
@@ -271,6 +279,10 @@ void OsvVulkanStitcher::freeResources()
         vkDestroySampler(device_, sampler_, nullptr);
         sampler_ = VK_NULL_HANDLE;
     }
+    if (samplerSeam_ != VK_NULL_HANDLE) {
+        vkDestroySampler(device_, samplerSeam_, nullptr);
+        samplerSeam_ = VK_NULL_HANDLE;
+    }
     if (viewMaster_ != VK_NULL_HANDLE) {
         vkDestroyImageView(device_, viewMaster_, nullptr);
         viewMaster_ = VK_NULL_HANDLE;
@@ -282,6 +294,10 @@ void OsvVulkanStitcher::freeResources()
     if (viewOut_ != VK_NULL_HANDLE) {
         vkDestroyImageView(device_, viewOut_, nullptr);
         viewOut_ = VK_NULL_HANDLE;
+    }
+    if (viewSeamLut_ != VK_NULL_HANDLE) {
+        vkDestroyImageView(device_, viewSeamLut_, nullptr);
+        viewSeamLut_ = VK_NULL_HANDLE;
     }
     if (imgMaster_ != VK_NULL_HANDLE) {
         vkDestroyImage(device_, imgMaster_, nullptr);
@@ -295,6 +311,10 @@ void OsvVulkanStitcher::freeResources()
         vkDestroyImage(device_, imgOut_, nullptr);
         imgOut_ = VK_NULL_HANDLE;
     }
+    if (imgSeamLut_ != VK_NULL_HANDLE) {
+        vkDestroyImage(device_, imgSeamLut_, nullptr);
+        imgSeamLut_ = VK_NULL_HANDLE;
+    }
     if (memMaster_ != VK_NULL_HANDLE) {
         vkFreeMemory(device_, memMaster_, nullptr);
         memMaster_ = VK_NULL_HANDLE;
@@ -306,6 +326,10 @@ void OsvVulkanStitcher::freeResources()
     if (memOut_ != VK_NULL_HANDLE) {
         vkFreeMemory(device_, memOut_, nullptr);
         memOut_ = VK_NULL_HANDLE;
+    }
+    if (memSeamLut_ != VK_NULL_HANDLE) {
+        vkFreeMemory(device_, memSeamLut_, nullptr);
+        memSeamLut_ = VK_NULL_HANDLE;
     }
     if (stageInMasterMem_ != VK_NULL_HANDLE) {
         if (mappedInMaster_) {
@@ -331,6 +355,14 @@ void OsvVulkanStitcher::freeResources()
         vkFreeMemory(device_, stageOutMem_, nullptr);
         stageOutMem_ = VK_NULL_HANDLE;
     }
+    if (stageSeamLutMem_ != VK_NULL_HANDLE) {
+        if (mappedSeamLut_) {
+            vkUnmapMemory(device_, stageSeamLutMem_);
+            mappedSeamLut_ = nullptr;
+        }
+        vkFreeMemory(device_, stageSeamLutMem_, nullptr);
+        stageSeamLutMem_ = VK_NULL_HANDLE;
+    }
     if (stageInMaster_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, stageInMaster_, nullptr);
         stageInMaster_ = VK_NULL_HANDLE;
@@ -342,6 +374,10 @@ void OsvVulkanStitcher::freeResources()
     if (stageOut_ != VK_NULL_HANDLE) {
         vkDestroyBuffer(device_, stageOut_, nullptr);
         stageOut_ = VK_NULL_HANDLE;
+    }
+    if (stageSeamLut_ != VK_NULL_HANDLE) {
+        vkDestroyBuffer(device_, stageSeamLut_, nullptr);
+        stageSeamLut_ = VK_NULL_HANDLE;
     }
 
     alloc_sensor_w_ = 0;
@@ -416,17 +452,23 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
               stageOutMem_,
               true,
               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    createBuf(128 * sizeof(float),
+              VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+              VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+              stageSeamLut_,
+              stageSeamLutMem_);
 
     vkMapMemory(device_, stageInMasterMem_, 0, inBytes, 0, &mappedInMaster_);
     vkMapMemory(device_, stageInSlaveMem_, 0, inBytes, 0, &mappedInSlave_);
     vkMapMemory(device_, stageOutMem_, 0, outBytes, 0, &mappedOut_);
+    vkMapMemory(device_, stageSeamLutMem_, 0, 128 * sizeof(float), 0, &mappedSeamLut_);
 
     auto createImg =
-        [&](uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImage &img, VkDeviceMemory &mem) {
+        [&](uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImage &img, VkDeviceMemory &mem, VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM) {
             VkImageCreateInfo iInfo{};
             iInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             iInfo.imageType = VK_IMAGE_TYPE_2D;
-            iInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            iInfo.format = fmt;
             iInfo.extent = {w, h, 1};
             iInfo.mipLevels = 1;
             iInfo.arrayLayers = 1;
@@ -464,13 +506,19 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
               VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
               imgOut_,
               memOut_);
+    createImg(128,
+              1,
+              VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+              imgSeamLut_,
+              memSeamLut_,
+              VK_FORMAT_R32_SFLOAT);
 
-    auto createView = [&](VkImage img, VkImageView &view) {
+    auto createView = [&](VkImage img, VkImageView &view, VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM) {
         VkImageViewCreateInfo vInfo{};
         vInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         vInfo.image = img;
         vInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        vInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        vInfo.format = fmt;
         vInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         vInfo.subresourceRange.levelCount = 1;
         vInfo.subresourceRange.layerCount = 1;
@@ -480,6 +528,7 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     createView(imgMaster_, viewMaster_);
     createView(imgSlave_, viewSlave_);
     createView(imgOut_, viewOut_);
+    createView(imgSeamLut_, viewSeamLut_, VK_FORMAT_R32_SFLOAT);
 
     VkSamplerCreateInfo sInfo{};
     sInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -490,11 +539,20 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     sInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
     vkCreateSampler(device_, &sInfo, nullptr, &sampler_);
 
+    VkSamplerCreateInfo sSeamInfo{};
+    sSeamInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
+    sSeamInfo.magFilter = VK_FILTER_LINEAR;
+    sSeamInfo.minFilter = VK_FILTER_LINEAR;
+    sSeamInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT;
+    sSeamInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    sSeamInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
+    vkCreateSampler(device_, &sSeamInfo, nullptr, &samplerSeam_);
+
     VkDescriptorPoolSize poolSizes[2]{};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
     poolSizes[0].descriptorCount = 1;
     poolSizes[1].type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
-    poolSizes[1].descriptorCount = 2;
+    poolSizes[1].descriptorCount = 3;
 
     VkDescriptorPoolCreateInfo poolInfo{};
     poolInfo.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
@@ -524,7 +582,12 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     slaveInfo.imageView = viewSlave_;
     slaveInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 
-    VkWriteDescriptorSet writes[3]{};
+    VkDescriptorImageInfo seamInfo{};
+    seamInfo.sampler = samplerSeam_;
+    seamInfo.imageView = viewSeamLut_;
+    seamInfo.imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+
+    VkWriteDescriptorSet writes[4]{};
     writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     writes[0].dstSet = descSet_;
     writes[0].dstBinding = 0;
@@ -546,7 +609,14 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     writes[2].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
     writes[2].pImageInfo = &slaveInfo;
 
-    vkUpdateDescriptorSets(device_, 3, writes, 0, nullptr);
+    writes[3].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writes[3].dstSet = descSet_;
+    writes[3].dstBinding = 3;
+    writes[3].descriptorCount = 1;
+    writes[3].descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writes[3].pImageInfo = &seamInfo;
+
+    vkUpdateDescriptorSets(device_, 4, writes, 0, nullptr);
 
     VkCommandBufferAllocateInfo cmdAllocInfo{};
     cmdAllocInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
@@ -560,6 +630,177 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     vkCreateFence(device_, &fenceInfo, nullptr, &fence_);
 
     return true;
+}
+
+namespace {
+
+struct Vec3f {
+    float x, y, z;
+    Vec3f operator+(const Vec3f& o) const { return {x + o.x, y + o.y, z + o.z}; }
+    Vec3f operator-(const Vec3f& o) const { return {x - o.x, y - o.y, z - o.z}; }
+    Vec3f operator*(float s) const { return {x * s, y * s, z * s}; }
+};
+
+static inline Vec3f crossVec(const Vec3f& a, const Vec3f& b) {
+    return { a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x };
+}
+
+static inline float dotVec(const Vec3f& a, const Vec3f& b) {
+    return a.x * b.x + a.y * b.y + a.z * b.z;
+}
+
+static inline Vec3f normVec(const Vec3f& v) {
+    float l = std::sqrt(dotVec(v, v));
+    return l > 1e-6f ? Vec3f{v.x / l, v.y / l, v.z / l} : v;
+}
+
+static inline Vec3f quatRotate(const float q[4], const Vec3f& v) {
+    Vec3f qvec = {q[1], q[2], q[3]};
+    Vec3f uv = crossVec(qvec, v);
+    Vec3f uuv = crossVec(qvec, uv);
+    return v + (uv * q[0] + uuv) * 2.0f;
+}
+
+static inline float kannalaBrandtRd(float th, const float k[4]) {
+    const float th0 = 1.57079632679f;
+    if (th <= th0) {
+        float t2 = th * th, t4 = t2 * t2, t6 = t4 * t2, t8 = t4 * t4;
+        return th * (1.0f + k[0] * t2 + k[1] * t4 + k[2] * t6 + k[3] * t8);
+    } else {
+        float t2 = th0 * th0, t4 = t2 * t2, t6 = t4 * t2, t8 = t4 * t4;
+        float rd0 = th0 * (1.0f + k[0] * t2 + k[1] * t4 + k[2] * t6 + k[3] * t8);
+        float drd0 = 1.0f + 3.0f * k[0] * t2 + 5.0f * k[1] * t4 + 7.0f * k[2] * t6 + 9.0f * k[3] * t8;
+        return rd0 + drd0 * (th - th0);
+    }
+}
+
+static inline bool projectLens(const Vec3f& dLens, const LensCalibration& cal, uint32_t w, uint32_t h, float& px, float& py) {
+    float rho = std::sqrt(dLens.x * dLens.x + dLens.y * dLens.y);
+    float th = std::atan2(rho, dLens.z);
+    if (th > 1.70327f) return false; // 97.59 deg
+    float rd = kannalaBrandtRd(th, &cal.k1);
+    float safe_rho = std::max(rho, 1e-6f);
+    px = cal.cx + cal.fx * rd * (dLens.x / safe_rho);
+    py = cal.cy + cal.fy * rd * (dLens.y / safe_rho);
+    return (px >= 0.0f && px < (float)(w - 1) && py >= 0.0f && py < (float)(h - 1));
+}
+
+static inline float sampleLuma(const uint8_t* rgba, size_t stride, float px, float py) {
+    int x0 = (int)px;
+    int y0 = (int)py;
+    const uint8_t* p = rgba + y0 * stride + x0 * 4;
+    return (p[0] * 0.299f + p[1] * 0.587f + p[2] * 0.114f) * (1.0f / 255.0f);
+}
+
+} // namespace
+
+void OsvVulkanStitcher::computeSeamLut(
+    const uint8_t* master_rgba,
+    size_t master_stride,
+    const uint8_t* slave_rgba,
+    size_t slave_stride,
+    uint32_t sensor_w,
+    uint32_t sensor_h,
+    const LensCalibration& lens_master,
+    const LensCalibration& lens_slave,
+    float* out_phis
+) {
+    float q_m_inv[4] = {lens_master.quat[0], -lens_master.quat[1], -lens_master.quat[2], -lens_master.quat[3]};
+    float q_s_inv[4] = {lens_slave.quat[0], -lens_slave.quat[1], -lens_slave.quat[2], -lens_slave.quat[3]};
+    Vec3f aMaster = quatRotate(q_m_inv, {0.0f, 0.0f, 1.0f});
+    Vec3f aSlave  = quatRotate(q_s_inv, {0.0f, 0.0f, 1.0f});
+
+    Vec3f nBisector = normVec(aMaster - aSlave);
+    Vec3f uSeam = normVec(crossVec(aMaster, aSlave));
+    Vec3f vSeam = normVec(crossVec(nBisector, uSeam));
+
+    const int N_KNOTS = 128;
+    const int N_CAND = 17;
+    const float maxSearch = 6.2f * (3.14159265f / 180.0f);
+    float costs[N_KNOTS][N_CAND];
+
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < N_KNOTS; ++k) {
+        float aK = -3.141592653589793f + float(k) * (2.0f * 3.141592653589793f / float(N_KNOTS));
+        for (int c = 0; c < N_CAND; ++c) {
+            float candPhi = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
+            float diffAccum = 0.0f, edgeAccum = 0.0f;
+            int validCount = 0;
+            float prevM = 0.0f, prevS = 0.0f;
+            for (int j = -2; j <= 2; ++j) {
+                float aSub = aK + float(j) * (0.75f * 3.14159265f / 180.0f);
+                Vec3f dSub = uSeam * std::cos(aSub) + vSeam * std::sin(aSub);
+                Vec3f dTest = normVec(dSub * std::cos(candPhi) + nBisector * std::sin(candPhi));
+                Vec3f d_m = quatRotate(lens_master.quat, dTest);
+                Vec3f d_s = quatRotate(lens_slave.quat, dTest);
+                float px_m, py_m, px_s, py_s;
+                if (projectLens(d_m, lens_master, sensor_w, sensor_h, px_m, py_m) &&
+                    projectLens(d_s, lens_slave, sensor_w, sensor_h, px_s, py_s)) {
+                    float cM = sampleLuma(master_rgba, master_stride, px_m, py_m);
+                    float cS = sampleLuma(slave_rgba, slave_stride, px_s, py_s);
+                    diffAccum += std::abs(cM - cS);
+                    if (validCount > 0) edgeAccum += std::abs(cM - prevM) + std::abs(cS - prevS);
+                    prevM = cM;
+                    prevS = cS;
+                    validCount++;
+                }
+            }
+            if (validCount > 2) {
+                float avgDiff = diffAccum / float(validCount);
+                float normPhi = candPhi / maxSearch;
+                // Penalize squared photometric difference + forward optical bias keeping Master for front obstacles
+                float forwardBias = 0.003f * std::max(0.0f, normPhi);
+                costs[k][c] = avgDiff * avgDiff + 0.0005f * normPhi * normPhi + forwardBias;
+            } else {
+                costs[k][c] = 1e6f;
+            }
+        }
+    }
+
+    // Dynamic Programming across circular loop (2 passes to enforce seamless wrap)
+    float M[N_KNOTS * 2][N_CAND];
+    int backtrack[N_KNOTS * 2][N_CAND];
+    for (int c = 0; c < N_CAND; ++c) M[0][c] = costs[0][c];
+    const float smooth_step_penalty = 0.005f;
+    for (int k = 1; k < N_KNOTS * 2; ++k) {
+        int k_mod = k % N_KNOTS;
+        for (int c = 0; c < N_CAND; ++c) {
+            float best_val = 1e9f;
+            int best_prev = c;
+            for (int prev_c = 0; prev_c < N_CAND; ++prev_c) {
+                int dc = std::abs(c - prev_c);
+                if (dc > 2) continue; // enforce smooth C0 continuity across knots
+                float step_pen = smooth_step_penalty * float(dc);
+                float v = M[k - 1][prev_c] + step_pen;
+                if (v < best_val) {
+                    best_val = v;
+                    best_prev = prev_c;
+                }
+            }
+            M[k][c] = costs[k_mod][c] + best_val;
+            backtrack[k][c] = best_prev;
+        }
+    }
+
+    int best_c = 0;
+    float min_last = M[N_KNOTS * 2 - 1][0];
+    for (int c = 1; c < N_CAND; ++c) {
+        if (M[N_KNOTS * 2 - 1][c] < min_last) {
+            min_last = M[N_KNOTS * 2 - 1][c];
+            best_c = c;
+        }
+    }
+
+    int path[N_KNOTS * 2];
+    path[N_KNOTS * 2 - 1] = best_c;
+    for (int k = N_KNOTS * 2 - 2; k >= 0; --k) {
+        path[k] = backtrack[k + 1][path[k + 1]];
+    }
+
+    for (int k = 0; k < N_KNOTS; ++k) {
+        int c = path[N_KNOTS + k];
+        out_phis[k] = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
+    }
 }
 
 bool OsvVulkanStitcher::stitchFrames(const uint8_t *master_rgba,
@@ -580,6 +821,16 @@ bool OsvVulkanStitcher::stitchFrames(const uint8_t *master_rgba,
     size_t inBytes = sensor_w * sensor_h * 4;
     std::memcpy(mappedInMaster_, master_rgba, inBytes);
     std::memcpy(mappedInSlave_, slave_rgba, inBytes);
+
+    computeSeamLut(master_rgba,
+                   (size_t)sensor_w * 4,
+                   slave_rgba,
+                   (size_t)sensor_w * 4,
+                   sensor_w,
+                   sensor_h,
+                   lens_master,
+                   lens_slave,
+                   static_cast<float*>(mappedSeamLut_));
 
     return executeStitchPass(sensor_w,
                              sensor_h,
@@ -617,6 +868,16 @@ bool OsvVulkanStitcher::stitchSideBySide(const uint8_t *sbs_rgba,
         std::memcpy(dst_slave + (size_t) y * row_bytes, src_row, row_bytes);
         std::memcpy(dst_master + (size_t) y * row_bytes, src_row + row_bytes, row_bytes);
     }
+
+    computeSeamLut(sbs_rgba + (size_t)eye_w * 4,
+                   sbs_stride,
+                   sbs_rgba,
+                   sbs_stride,
+                   eye_w,
+                   eye_h,
+                   lens_master,
+                   lens_slave,
+                   static_cast<float*>(mappedSeamLut_));
 
     return executeStitchPass(eye_w,
                              eye_h,
@@ -679,6 +940,13 @@ bool OsvVulkanStitcher::executeStitchPass(uint32_t sensor_w,
                VK_ACCESS_TRANSFER_WRITE_BIT,
                VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                VK_PIPELINE_STAGE_TRANSFER_BIT);
+    transition(imgSeamLut_,
+               VK_IMAGE_LAYOUT_UNDEFINED,
+               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               0,
+               VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT);
     transition(imgOut_,
                VK_IMAGE_LAYOUT_UNDEFINED,
                VK_IMAGE_LAYOUT_GENERAL,
@@ -705,6 +973,18 @@ bool OsvVulkanStitcher::executeStitchPass(uint32_t sensor_w,
                            1,
                            &region);
 
+    VkBufferImageCopy seamRegion{};
+    seamRegion.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    seamRegion.imageSubresource.layerCount = 1;
+    seamRegion.imageExtent = {128, 1, 1};
+
+    vkCmdCopyBufferToImage(cmd_,
+                           stageSeamLut_,
+                           imgSeamLut_,
+                           VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                           1,
+                           &seamRegion);
+
     transition(imgMaster_,
                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
@@ -713,6 +993,13 @@ bool OsvVulkanStitcher::executeStitchPass(uint32_t sensor_w,
                VK_PIPELINE_STAGE_TRANSFER_BIT,
                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
     transition(imgSlave_,
+               VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+               VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+               VK_ACCESS_TRANSFER_WRITE_BIT,
+               VK_ACCESS_SHADER_READ_BIT,
+               VK_PIPELINE_STAGE_TRANSFER_BIT,
+               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT);
+    transition(imgSeamLut_,
                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
                VK_ACCESS_TRANSFER_WRITE_BIT,
@@ -757,10 +1044,10 @@ bool OsvVulkanStitcher::executeStitchPass(uint32_t sensor_w,
         pc.gyro_quat[3] = 0.0f;
     }
 
-    pc.outWidth = out_w;
-    pc.outHeight = out_h;
+    pc.packedDims = (out_w & 0xFFFFu) | ((out_h & 0xFFFFu) << 16u);
+    pc.stitchRadius = 0.0f; // pure angular projection to preserve straight architectural lines
     pc.maxFovDegrees = 195.18f;
-    pc.blendOverlapDegrees = 10.0f;
+    pc.blendOverlapDegrees = 14.5f; // full optical overlap band
 
     vkCmdPushConstants(cmd_,
                        pipeline_layout_,
