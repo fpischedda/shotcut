@@ -97,7 +97,19 @@ static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, double seek_se
 
 int main(int argc, char** argv) {
     std::string osv_path = "/home/fra/Videos/2026-11-03/CAM_20261103144622_0006_D.OSV";
-    if (argc > 1) {
+    bool raw_images_mode = false;
+    std::string raw_master_path, raw_slave_path;
+    std::string custom_out_ppm;
+
+    if (argc >= 4 && std::string(argv[1]) == "--raw") {
+        raw_images_mode = true;
+        raw_master_path = argv[2];
+        raw_slave_path = argv[3];
+        osv_path = argv[4];
+        if (argc > 5) {
+            custom_out_ppm = argv[5];
+        }
+    } else if (argc > 1) {
         osv_path = argv[1];
     }
 
@@ -133,34 +145,51 @@ int main(int argc, char** argv) {
               << ", y=" << meta.lens_rear.quat[2] << ", z=" << meta.lens_rear.quat[3] << "]" << std::endl;
 
     // Step 2: Decode 1 frame from each lens stream
-    AVFormatContext* fmt_ctx = nullptr;
-    if (avformat_open_input(&fmt_ctx, osv_path.c_str(), nullptr, nullptr) < 0) {
-        std::cerr << "Failed to open video file" << std::endl;
-        return 1;
-    }
-    avformat_find_stream_info(fmt_ctx, nullptr);
-
     std::vector<uint8_t> frameSlave, frameMaster;
     int w0 = 0, h0 = 0, w1 = 0, h1 = 0;
-
     double seek_sec = 0.0;
-    if (argc > 2) {
-        seek_sec = std::stod(argv[2]);
+
+    if (raw_images_mode) {
+        std::cout << "[Decode] Loading raw Master frame from: " << raw_master_path << std::endl;
+        AVFormatContext* fmt_m = nullptr;
+        if (avformat_open_input(&fmt_m, raw_master_path.c_str(), nullptr, nullptr) >= 0) {
+            avformat_find_stream_info(fmt_m, nullptr);
+            decodeFrame(fmt_m, 0, 0.0, frameMaster, w1, h1);
+            avformat_close_input(&fmt_m);
+        }
+        std::cout << "[Decode] Loading raw Slave frame from: " << raw_slave_path << std::endl;
+        AVFormatContext* fmt_s = nullptr;
+        if (avformat_open_input(&fmt_s, raw_slave_path.c_str(), nullptr, nullptr) >= 0) {
+            avformat_find_stream_info(fmt_s, nullptr);
+            decodeFrame(fmt_s, 0, 0.0, frameSlave, w0, h0);
+            avformat_close_input(&fmt_s);
+        }
+    } else {
+        AVFormatContext* fmt_ctx = nullptr;
+        if (avformat_open_input(&fmt_ctx, osv_path.c_str(), nullptr, nullptr) < 0) {
+            std::cerr << "Failed to open video file" << std::endl;
+            return 1;
+        }
+        avformat_find_stream_info(fmt_ctx, nullptr);
+
+        if (argc > 2) {
+            seek_sec = std::stod(argv[2]);
+        }
+
+        std::cout << "[Decode] Decoding Slave Lens (Stream 0) at " << seek_sec << "s..." << std::endl;
+        decodeFrame(fmt_ctx, 0, seek_sec, frameSlave, w0, h0);
+
+        // Reopen context for stream 1 seek
+        avformat_close_input(&fmt_ctx);
+        fmt_ctx = nullptr;
+        avformat_open_input(&fmt_ctx, osv_path.c_str(), nullptr, nullptr);
+        avformat_find_stream_info(fmt_ctx, nullptr);
+
+        std::cout << "[Decode] Decoding Master Lens (Stream 1) at " << seek_sec << "s..." << std::endl;
+        decodeFrame(fmt_ctx, 1, seek_sec, frameMaster, w1, h1);
+
+        avformat_close_input(&fmt_ctx);
     }
-
-    std::cout << "[Decode] Decoding Slave Lens (Stream 0) at " << seek_sec << "s..." << std::endl;
-    decodeFrame(fmt_ctx, 0, seek_sec, frameSlave, w0, h0);
-
-    // Reopen context for stream 1 seek
-    avformat_close_input(&fmt_ctx);
-    fmt_ctx = nullptr;
-    avformat_open_input(&fmt_ctx, osv_path.c_str(), nullptr, nullptr);
-    avformat_find_stream_info(fmt_ctx, nullptr);
-
-    std::cout << "[Decode] Decoding Master Lens (Stream 1) at " << seek_sec << "s..." << std::endl;
-    decodeFrame(fmt_ctx, 1, seek_sec, frameMaster, w1, h1);
-
-    avformat_close_input(&fmt_ctx);
 
     std::cout << "[Decode] Stream 0: " << w0 << "x" << h0 << " | Stream 1: " << w1 << "x" << h1 << std::endl;
     if (w0 == 0 || w1 == 0) {
@@ -230,7 +259,9 @@ int main(int argc, char** argv) {
     if (ok) {
         std::cout << "[Vulkan] Stitching completed successfully!" << std::endl;
         std::string out_ppm = "stitched_vulkan_preview.ppm";
-        if (argc > 3) {
+        if (!custom_out_ppm.empty()) {
+            out_ppm = custom_out_ppm;
+        } else if (argc > 3) {
             out_ppm = argv[3];
         }
         writePPM(out_ppm, out_w, out_h, out_equirect.data());

@@ -760,6 +760,14 @@ void OsvVulkanStitcher::computeSeamLut(
             }
         }
 
+        // Detect foreground obstacles across the candidate angles at knot k
+        float maxKnotDiff = 0.0f;
+        for (int c = 0; c < N_CAND; ++c) {
+            if (validKnot[k][c]) {
+                maxKnotDiff = std::max(maxKnotDiff, diffs[k][c]);
+            }
+        }
+
         // Calculate gradient across candidate angles to heavily penalize crossing sharp edges
         for (int c = 0; c < N_CAND; ++c) {
             if (!validKnot[k][c]) {
@@ -782,23 +790,35 @@ void OsvVulkanStitcher::computeSeamLut(
             float avgDiff = diffs[k][c];
             float candPhi = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
             float normPhi = candPhi / maxSearch;
-            // Penalize:
-            // 1. Squared photometric disparity (edges / high error)
-            // 2. Center deviation (gentle preference for 50/50 split when scene is uniform)
-            // 3. Forward optical bias (strongly favor Master for obstacles in forward hemisphere)
-            // 4. Directional edge-crossing penalty (repel seam from cutting across sharp contrast lines)
-            float forwardBias = 0.003f * std::max(0.0f, normPhi);
-            costs[k][c] = avgDiff * avgDiff + 0.0005f * normPhi * normPhi + forwardBias + 0.05f * edgePenalty * edgePenalty;
+
+            // Obstacle Repulsion:
+            // When maxKnotDiff > 0.12f, a foreground obstacle is present at this knot.
+            // Strongly penalize cutting through the obstacle body/edges, and guide the seam
+            // towards the Master lens side (candPhi < 0) where optics and lighting are superior.
+            float obstacleCost = 0.0f;
+            if (maxKnotDiff > 0.12f) {
+                float disparityRatio = avgDiff / maxKnotDiff;
+                obstacleCost = 0.25f * (disparityRatio * disparityRatio);
+                // Forward optical preference for Master lens on obstacles
+                if (normPhi > 0.0f) {
+                    obstacleCost += 0.08f * normPhi;
+                }
+            }
+
+            float centerPref = 0.0005f * normPhi * normPhi;
+            float edgeCost = 0.05f * edgePenalty * edgePenalty;
+            costs[k][c] = avgDiff * avgDiff + centerPref + obstacleCost + edgeCost;
         }
     }
 
-    // Dynamic Programming across circular loop (2 passes to enforce seamless wrap)
-    float M[N_KNOTS * 2][N_CAND];
-    int backtrack[N_KNOTS * 2][N_CAND];
+    // Dynamic Programming across circular loop:
+    // Pass 1: Warm-up over N_KNOTS to discover steady-state endpoint seed
+    float M[N_KNOTS][N_CAND];
+    int backtrack[N_KNOTS][N_CAND];
     for (int c = 0; c < N_CAND; ++c) M[0][c] = costs[0][c];
-    const float smooth_step_penalty = 0.005f;
-    for (int k = 1; k < N_KNOTS * 2; ++k) {
-        int k_mod = k % N_KNOTS;
+    const float smooth_step_penalty = 0.020f;
+
+    for (int k = 1; k < N_KNOTS; ++k) {
         for (int c = 0; c < N_CAND; ++c) {
             float best_val = 1e9f;
             int best_prev = c;
@@ -812,34 +832,87 @@ void OsvVulkanStitcher::computeSeamLut(
                     best_prev = prev_c;
                 }
             }
-            M[k][c] = costs[k_mod][c] + best_val;
+            M[k][c] = costs[k][c] + best_val;
             backtrack[k][c] = best_prev;
         }
     }
 
-    int best_c = 0;
-    float min_last = M[N_KNOTS * 2 - 1][0];
+    int best_end_c = 0;
+    float min_last = M[N_KNOTS - 1][0];
     for (int c = 1; c < N_CAND; ++c) {
-        if (M[N_KNOTS * 2 - 1][c] < min_last) {
-            min_last = M[N_KNOTS * 2 - 1][c];
-            best_c = c;
+        if (M[N_KNOTS - 1][c] < min_last) {
+            min_last = M[N_KNOTS - 1][c];
+            best_end_c = c;
         }
     }
 
-    int path[N_KNOTS * 2];
-    path[N_KNOTS * 2 - 1] = best_c;
-    for (int k = N_KNOTS * 2 - 2; k >= 0; --k) {
+    // Pass 2: Cyclic-Constrained DP
+    // Initialize knot 0 anchored to best_end_c, and enforce circular wrap closure |c(N-1) - c(0)| <= 2
+    for (int c = 0; c < N_CAND; ++c) {
+        int dc = std::abs(c - best_end_c);
+        if (dc <= 2) {
+            M[0][c] = costs[0][c] + smooth_step_penalty * float(dc);
+        } else {
+            M[0][c] = 1e9f;
+        }
+    }
+
+    for (int k = 1; k < N_KNOTS; ++k) {
+        for (int c = 0; c < N_CAND; ++c) {
+            float best_val = 1e9f;
+            int best_prev = c;
+            for (int prev_c = 0; prev_c < N_CAND; ++prev_c) {
+                int dc = std::abs(c - prev_c);
+                if (dc > 2) continue;
+                float step_pen = smooth_step_penalty * float(dc);
+                float v = M[k - 1][prev_c] + step_pen;
+                if (v < best_val) {
+                    best_val = v;
+                    best_prev = prev_c;
+                }
+            }
+            M[k][c] = costs[k][c] + best_val;
+            backtrack[k][c] = best_prev;
+        }
+    }
+
+    // Select endpoint that closes loop with knot 0 anchor
+    int final_c = best_end_c;
+    float min_closed = 1e9f;
+    for (int c = 0; c < N_CAND; ++c) {
+        int dc = std::abs(c - best_end_c);
+        if (dc <= 2 && M[N_KNOTS - 1][c] < min_closed) {
+            min_closed = M[N_KNOTS - 1][c];
+            final_c = c;
+        }
+    }
+
+    int path[N_KNOTS];
+    path[N_KNOTS - 1] = final_c;
+    for (int k = N_KNOTS - 2; k >= 0; --k) {
         path[k] = backtrack[k + 1][path[k + 1]];
+    }
+
+    // Convert candidates to angles and apply 3-tap circular smoothing filter
+    float raw_phis[N_KNOTS];
+    for (int k = 0; k < N_KNOTS; ++k) {
+        int c = path[k];
+        raw_phis[k] = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
+    }
+
+    float smoothed_phis[N_KNOTS];
+    for (int k = 0; k < N_KNOTS; ++k) {
+        int prev_k = (k - 1 + N_KNOTS) % N_KNOTS;
+        int next_k = (k + 1) % N_KNOTS;
+        smoothed_phis[k] = 0.25f * raw_phis[prev_k] + 0.50f * raw_phis[k] + 0.25f * raw_phis[next_k];
     }
 
     // Resolve knots with temporal moving average to prevent video frame-to-frame seam jitter
     for (int k = 0; k < N_KNOTS; ++k) {
-        int c = path[N_KNOTS + k];
-        float raw_phi = -maxSearch + float(c) * (2.0f * maxSearch / float(N_CAND - 1));
         if (has_prev_seam_) {
-            out_phis[k] = 0.65f * prev_seam_phis_[k] + 0.35f * raw_phi;
+            out_phis[k] = 0.65f * prev_seam_phis_[k] + 0.35f * smoothed_phis[k];
         } else {
-            out_phis[k] = raw_phi;
+            out_phis[k] = smoothed_phis[k];
         }
         prev_seam_phis_[k] = out_phis[k];
     }

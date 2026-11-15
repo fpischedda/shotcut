@@ -216,9 +216,15 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
     float4 finalCol;
     if (validMaster && validSlave) {
         float tWide = smoothstep(-halfOverlap, halfOverlap, phiSeam);
-        float deltaX = fminf(fmaxf(colorMaster.x - colorSlave.x, -0.15f), 0.15f);
-        float deltaY = fminf(fmaxf(colorMaster.y - colorSlave.y, -0.15f), 0.15f);
-        float deltaZ = fminf(fmaxf(colorMaster.z - colorSlave.z, -0.15f), 0.15f);
+        float dx = colorMaster.x - colorSlave.x;
+        float dy = colorMaster.y - colorSlave.y;
+        float dz = colorMaster.z - colorSlave.z;
+        float colorDiff = sqrtf(dx * dx + dy * dy + dz * dz);
+        float exposureWeight = smoothstep(0.18f, 0.05f, colorDiff);
+
+        float deltaX = fminf(fmaxf((colorMaster.x - colorSlave.x) * exposureWeight, -0.15f), 0.15f);
+        float deltaY = fminf(fmaxf((colorMaster.y - colorSlave.y) * exposureWeight, -0.15f), 0.15f);
+        float deltaZ = fminf(fmaxf((colorMaster.z - colorSlave.z) * exposureWeight, -0.15f), 0.15f);
 
         float balSlaveX = colorSlave.x + tWide * deltaX;
         float balSlaveY = colorSlave.y + tWide * deltaY;
@@ -228,12 +234,8 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
         float balMasterY = colorMaster.y - (1.0f - tWide) * deltaY;
         float balMasterZ = colorMaster.z - (1.0f - tWide) * deltaZ;
 
-        float dx = colorMaster.x - colorSlave.x;
-        float dy = colorMaster.y - colorSlave.y;
-        float dz = colorMaster.z - colorSlave.z;
-        float colorDiff = sqrtf(dx * dx + dy * dy + dz * dz);
-        float mismatch = smoothstep(0.05f, 0.20f, colorDiff);
-        float minHalf = 0.25f * deg2rad;
+        float mismatch = smoothstep(0.05f, 0.15f, colorDiff);
+        float minHalf = 0.02f * deg2rad;
         float effectiveHalf = blendHalf + mismatch * (minHalf - blendHalf);
         float adaptiveBlend = smoothstep(phiCut - effectiveHalf, phiCut + effectiveHalf, phiSeam);
 
