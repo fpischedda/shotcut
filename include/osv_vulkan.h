@@ -109,7 +109,7 @@ private:
     VkCommandBuffer cmd_ = VK_NULL_HANDLE;
     VkFence fence_ = VK_NULL_HANDLE;
 
-    float stitchRadius_ = 0.0f;
+    float stitchRadius_ = 2.2f;
     bool has_prev_seam_ = false;
     float prev_seam_phis_[128] = {0.0f};
 

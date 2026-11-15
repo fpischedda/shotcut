@@ -680,8 +680,10 @@ static inline bool projectLens(const Vec3f& dLens, const LensCalibration& cal, u
     if (th > 1.70327f) return false; // 97.59 deg
     float rd = kannalaBrandtRd(th, &cal.k1);
     float safe_rho = std::max(rho, 1e-6f);
-    px = cal.cx + cal.fx * rd * (dLens.x / safe_rho);
-    py = cal.cy + cal.fy * rd * (dLens.y / safe_rho);
+    float sx = (float)w / 3840.0f;
+    float sy = (float)h / 3840.0f;
+    px = (cal.cx + cal.fx * rd * (dLens.x / safe_rho)) * sx;
+    py = (cal.cy + cal.fy * rd * (dLens.y / safe_rho)) * sy;
     return (px >= 0.0f && px < (float)(w - 1) && py >= 0.0f && py < (float)(h - 1));
 }
 
@@ -793,16 +795,12 @@ void OsvVulkanStitcher::computeSeamLut(
 
             // Obstacle Repulsion:
             // When maxKnotDiff > 0.12f, a foreground obstacle is present at this knot.
-            // Strongly penalize cutting through the obstacle body/edges, and guide the seam
-            // towards the Master lens side (candPhi < 0) where optics and lighting are superior.
+            // Heavily penalize candidate angles where disparity is high, guiding the seam
+            // smoothly into regions of minimum optical difference without unilateral kinks.
             float obstacleCost = 0.0f;
             if (maxKnotDiff > 0.12f) {
                 float disparityRatio = avgDiff / maxKnotDiff;
-                obstacleCost = 0.25f * (disparityRatio * disparityRatio);
-                // Forward optical preference for Master lens on obstacles
-                if (normPhi > 0.0f) {
-                    obstacleCost += 0.08f * normPhi;
-                }
+                obstacleCost = 0.35f * (disparityRatio * disparityRatio);
             }
 
             float centerPref = 0.0005f * normPhi * normPhi;
@@ -816,7 +814,7 @@ void OsvVulkanStitcher::computeSeamLut(
     float M[N_KNOTS][N_CAND];
     int backtrack[N_KNOTS][N_CAND];
     for (int c = 0; c < N_CAND; ++c) M[0][c] = costs[0][c];
-    const float smooth_step_penalty = 0.020f;
+    const float smooth_step_penalty = 0.035f;
 
     for (int k = 1; k < N_KNOTS; ++k) {
         for (int c = 0; c < N_CAND; ++c) {

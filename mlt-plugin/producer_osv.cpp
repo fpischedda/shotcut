@@ -455,6 +455,8 @@ static int producer_get_image(mlt_frame frame,
                     const char *env_radius = std::getenv("OSV_STITCH_RADIUS");
                     if (env_radius) {
                         stitch_radius = std::atof(env_radius);
+                    } else {
+                        stitch_radius = 2.2;
                     }
                 }
                 ctx->stitcher->setStitchRadius((float) stitch_radius);
@@ -564,6 +566,8 @@ static int producer_get_image(mlt_frame frame,
             const char *env_radius = std::getenv("OSV_STITCH_RADIUS");
             if (env_radius) {
                 stitch_radius = std::atof(env_radius);
+            } else {
+                stitch_radius = 2.2;
             }
         }
         ctx->stitcher->setStitchRadius((float) stitch_radius);
