@@ -45,8 +45,9 @@ osmo-360/
 
 ## Building
 
+From the repository root:
+
 ```bash
-cd /home/fra/personal/osmo-360
 mkdir -p build && cd build
 cmake ..
 make -j$(nproc)
@@ -66,7 +67,7 @@ The build produces:
 To launch Shotcut with the native OSV plugin loaded:
 
 ```bash
-/home/fra/personal/osmo-360/bin/shotcut-osv
+./bin/shotcut-osv
 ```
 
 1. Open any `.OSV` file via **File -> Open File** or drag & drop onto the timeline.
@@ -78,7 +79,7 @@ To launch Shotcut with the native OSV plugin loaded:
 To extract metadata and render a stitched equirectangular frame directly to disk:
 
 ```bash
-/home/fra/personal/osmo-360/build/osv_stitch /path/to/CAM_..._D.OSV
+./build/osv_stitch /path/to/CAM_..._D.OSV
 ```
 
 Outputs:
@@ -88,5 +89,5 @@ Outputs:
 ### 3. Rendering via `melt` CLI
 
 ```bash
-/home/fra/personal/osmo-360/bin/melt-osv /path/to/CAM_..._D.OSV -consumer avformat:output_360.mp4 vcodec=libx264
+./bin/melt-osv /path/to/CAM_..._D.OSV -consumer avformat:output_360.mp4 vcodec=libx264
 ```

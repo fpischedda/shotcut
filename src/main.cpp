@@ -96,12 +96,12 @@ static bool decodeFrame(AVFormatContext* fmt_ctx, int stream_idx, double seek_se
 }
 
 int main(int argc, char** argv) {
-    std::string osv_path = "/home/fra/Videos/2026-11-03/CAM_20261103144622_0006_D.OSV";
+    std::string osv_path;
     bool raw_images_mode = false;
     std::string raw_master_path, raw_slave_path;
     std::string custom_out_ppm;
 
-    if (argc >= 4 && std::string(argv[1]) == "--raw") {
+    if (argc >= 5 && std::string(argv[1]) == "--raw") {
         raw_images_mode = true;
         raw_master_path = argv[2];
         raw_slave_path = argv[3];
@@ -109,8 +109,14 @@ int main(int argc, char** argv) {
         if (argc > 5) {
             custom_out_ppm = argv[5];
         }
-    } else if (argc > 1) {
+    } else if (argc > 1 && std::string(argv[1]) != "--raw") {
         osv_path = argv[1];
+    }
+
+    if (osv_path.empty()) {
+        std::cerr << "Usage: " << argv[0] << " <osv_file>\n"
+                  << "       " << argv[0] << " --raw <master_ppm> <slave_ppm> <osv_file> [out_ppm]\n";
+        return 1;
     }
 
     std::cout << "========================================" << std::endl;
