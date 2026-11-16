@@ -72,10 +72,14 @@ struct ProducerOsvContext
         }
         const char *mlt_data = std::getenv("MLT_DATA");
         if (mlt_data) {
-            std::filesystem::path p = std::filesystem::path(mlt_data).parent_path().parent_path()
-                                      / "shaders" / "osv_stitch.spv";
-            if (std::filesystem::exists(p))
-                return p.string();
+            std::filesystem::path p1 = std::filesystem::path(mlt_data).parent_path().parent_path()
+                                       / "shaders" / "osv_stitch.spv";
+            if (std::filesystem::exists(p1))
+                return p1.string();
+            std::filesystem::path p2 = std::filesystem::path(mlt_data).parent_path().parent_path().parent_path()
+                                       / "shaders" / "osv_stitch.spv";
+            if (std::filesystem::exists(p2))
+                return p2.string();
         }
         try {
             std::filesystem::path exe_dir
@@ -104,6 +108,11 @@ struct ProducerOsvContext
             stitcher = std::make_unique<OsvVulkanStitcher>();
             std::string shader_path = resolveShaderPath();
             stitcher_initialized = stitcher->initialize(shader_path);
+            if (stitcher_initialized) {
+                std::cout << "[OSV-MLT] Vulkan stitcher initialized successfully with shader: " << shader_path << std::endl;
+            } else {
+                std::cerr << "[OSV-MLT] Vulkan stitcher initialization FAILED for: " << shader_path << std::endl;
+            }
         }
         return stitcher_initialized;
     }
@@ -799,8 +808,8 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile,
     mlt_properties_set(props, "shotcut:producer", "avformat");
 
     mlt_log_info(MLT_PRODUCER_SERVICE(producer),
-                 "[OSV-MLT] Loaded native OSV plugin (build 2026-11-10 direct-osv-v3)\n");
-    std::cout << "[OSV-MLT] Loaded native OSV plugin (build 2026-11-10 direct-osv-v3)" << std::endl;
+                 "[OSV-MLT] Loaded native OSV plugin v4.4-true-poly-monotonic (build 2026-11-16)\n");
+    std::cout << "[OSV-MLT] Loaded native OSV plugin v4.4-true-poly-monotonic (build 2026-11-16)" << std::endl;
 
     ctx->profile = profile;
     ctx->osv_path = filename ? filename : "";

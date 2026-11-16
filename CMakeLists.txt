@@ -37,6 +37,8 @@ set(SHADER_SPV ${CMAKE_CURRENT_SOURCE_DIR}/shaders/osv_stitch.spv)
 add_custom_command(
     OUTPUT ${SHADER_SPV}
     COMMAND glslc ${SHADER_SRC} -o ${SHADER_SPV}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SHADER_SPV} ${CMAKE_CURRENT_BINARY_DIR}/shaders/osv_stitch.spv
     DEPENDS ${SHADER_SRC}
     COMMENT "Compiling Vulkan compute shader osv_stitch.comp -> osv_stitch.spv"
 )

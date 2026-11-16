@@ -49,23 +49,16 @@ __device__ inline float2 projectKannalaBrandt(
     if (rho <= 1e-6f) {
         return make_float2(intrinsics.z / texSize.x, intrinsics.w / texSize.y);
     }
-    float th0 = 1.57079632679f; // 90.0 degrees (PI * 0.5)
-    float rd;
-    if (theta <= th0) {
-        float t2 = theta * theta;
-        float t4 = t2 * t2;
-        float t6 = t4 * t2;
-        float t8 = t4 * t4;
-        rd = theta * (1.0f + dist.x * t2 + dist.y * t4 + dist.z * t6 + dist.w * t8);
-    } else {
-        float t2 = th0 * th0;
-        float t4 = t2 * t2;
-        float t6 = t4 * t2;
-        float t8 = t4 * t4;
-        float rd0 = th0 * (1.0f + dist.x * t2 + dist.y * t4 + dist.z * t6 + dist.w * t8);
-        float drd0 = 1.0f + 3.0f * dist.x * t2 + 5.0f * dist.y * t4 + 7.0f * dist.z * t6 + 9.0f * dist.w * t8;
-        rd = rd0 + drd0 * (theta - th0);
-    }
+    // Factory calibrated Kannala-Brandt distortion model:
+    // Evaluate full 8th-order polynomial up to stationary peak (drd/dtheta = 0)
+    // Master: ~1.63587 rad (93.73 deg), Slave: ~1.70008 rad (97.41 deg)
+    float thPeak = (dist.w < -0.002f) ? 1.63587f : 1.70008f;
+    float safeTheta = fminf(theta, thPeak);
+    float t2 = safeTheta * safeTheta;
+    float t4 = t2 * t2;
+    float t6 = t4 * t2;
+    float t8 = t4 * t4;
+    float rd = safeTheta * (1.0f + dist.x * t2 + dist.y * t4 + dist.z * t6 + dist.w * t8);
 
     float px = intrinsics.z + intrinsics.x * rd * (dLens.x / rho);
     float py = intrinsics.w + intrinsics.y * rd * (dLens.y / rho);
@@ -103,6 +96,36 @@ __device__ inline float3 offsetToLensSlave(float3 dirBody, float3 aSlave, float 
     return dirBody;
 }
 
+__device__ inline float osv_smoothstep(float edge0, float edge1, float x)
+{
+    float t = fminf(fmaxf((x - edge0) / (edge1 - edge0), 0.0f), 1.0f);
+    return t * t * (3.0f - 2.0f * t);
+}
+
+// Elevation/ground-plane distance gradient:
+// Models natural scene geometry (close ground at nadir, expanding towards horizon, distant sky)
+// smoothly anchored around baseRadius for the primary subject.
+__device__ inline float computeEffectiveRadius(float3 dirEquirect, float baseRadius)
+{
+    if (baseRadius <= 0.05f || baseRadius >= 100.0f) {
+        return baseRadius;
+    }
+    float scale = baseRadius / 2.2f;
+    float z = dirEquirect.z;
+    if (z < 0.0f) {
+        float rGround = fminf(fmaxf(1.4f / fmaxf(-z, 0.18f), 1.3f), 5.0f) * scale;
+        float tHorizon = osv_smoothstep(-0.25f, 0.0f, z);
+        float wNadir = 1.0f - osv_smoothstep(-0.75f, -0.35f, z);
+        float r = baseRadius + tHorizon * (5.0f * scale - baseRadius);
+        return r + wNadir * (rGround - r);
+    } else {
+        float tSky = osv_smoothstep(0.0f, 0.4f, z);
+        float rHorizon = 5.0f * scale;
+        float rSky = 8.0f * scale;
+        return rHorizon + tSky * (rSky - rHorizon);
+    }
+}
+
 extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
                                              cudaTextureObject_t lensMaster,
                                              cudaTextureObject_t lensSlave,
@@ -125,7 +148,8 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
     float lat = (0.5f - v) * PI;
     float cosLat = cosf(lat);
 
-    float3 dBody = make_float3(sinf(lon) * cosLat, cosf(lon) * cosLat, sinf(lat));
+    float3 dEquirect = make_float3(sinf(lon) * cosLat, cosf(lon) * cosLat, sinf(lat));
+    float3 dBody = dEquirect;
 
     if (fabsf(params.gyro_quat.x - 1.0f) > 1e-5f || fabsf(params.gyro_quat.y) > 1e-5f
         || fabsf(params.gyro_quat.z) > 1e-5f || fabsf(params.gyro_quat.w) > 1e-5f) {
@@ -156,9 +180,10 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
     float alpha = atan2f(dBody.x * vSeam.x + dBody.y * vSeam.y + dBody.z * vSeam.z,
                          dBody.x * uSeam.x + dBody.y * uSeam.y + dBody.z * uSeam.z);
 
-    // Apply physical baseline offset to project equirectangular rays to virtual sphere at stitchRadius
-    float3 dBodyMaster = offsetToLensMaster(dBody, aMaster, params.stitchRadius);
-    float3 dBodySlave = offsetToLensSlave(dBody, aSlave, params.stitchRadius);
+    // Apply physical baseline offset with elevation-adaptive distance gradient
+    float effRadius = computeEffectiveRadius(dEquirect, params.stitchRadius);
+    float3 dBodyMaster = offsetToLensMaster(dBody, aMaster, effRadius);
+    float3 dBodySlave = offsetToLensSlave(dBody, aSlave, effRadius);
 
     // Rotate body ray directly into Master lens frame (+z optical axis): d_lens = R * d_body
     float3 dMaster = quatRotateWXYZ(params.lens_master.quat, dBodyMaster);
@@ -215,17 +240,35 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
 
     float4 finalCol;
     if (validMaster && validSlave) {
-        float tWide = smoothstep(-halfOverlap, halfOverlap, phiSeam);
-        float dx = colorMaster.x - colorSlave.x;
-        float dy = colorMaster.y - colorSlave.y;
-        float dz = colorMaster.z - colorSlave.z;
-        float colorDiff = sqrtf(dx * dx + dy * dy + dz * dz);
-        float exposureWeight = smoothstep(0.18f, 0.05f, colorDiff);
+        float2 texel = make_float2(3.0f / sensorSize.x, 3.0f / sensorSize.y);
+        float4 mBox0 = tex2D<float4>(lensMaster, fminf(fmaxf(rawUvMaster.x - texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvMaster.y - texel.y, 0.0f), 1.0f));
+        float4 mBox1 = tex2D<float4>(lensMaster, fminf(fmaxf(rawUvMaster.x + texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvMaster.y - texel.y, 0.0f), 1.0f));
+        float4 mBox2 = tex2D<float4>(lensMaster, fminf(fmaxf(rawUvMaster.x - texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvMaster.y + texel.y, 0.0f), 1.0f));
+        float4 mBox3 = tex2D<float4>(lensMaster, fminf(fmaxf(rawUvMaster.x + texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvMaster.y + texel.y, 0.0f), 1.0f));
+        float3 mBox = make_float3(0.25f * (mBox0.x + mBox1.x + mBox2.x + mBox3.x),
+                                  0.25f * (mBox0.y + mBox1.y + mBox2.y + mBox3.y),
+                                  0.25f * (mBox0.z + mBox1.z + mBox2.z + mBox3.z));
+
+        float4 sBox0 = tex2D<float4>(lensSlave, fminf(fmaxf(rawUvSlave.x - texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvSlave.y - texel.y, 0.0f), 1.0f));
+        float4 sBox1 = tex2D<float4>(lensSlave, fminf(fmaxf(rawUvSlave.x + texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvSlave.y - texel.y, 0.0f), 1.0f));
+        float4 sBox2 = tex2D<float4>(lensSlave, fminf(fmaxf(rawUvSlave.x - texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvSlave.y + texel.y, 0.0f), 1.0f));
+        float4 sBox3 = tex2D<float4>(lensSlave, fminf(fmaxf(rawUvSlave.x + texel.x, 0.0f), 1.0f), fminf(fmaxf(rawUvSlave.y + texel.y, 0.0f), 1.0f));
+        float3 sBox = make_float3(0.25f * (sBox0.x + sBox1.x + sBox2.x + sBox3.x),
+                                  0.25f * (sBox0.y + sBox1.y + sBox2.y + sBox3.y),
+                                  0.25f * (sBox0.z + sBox1.z + sBox2.z + sBox3.z));
+
+        float sdx = mBox.x - sBox.x;
+        float sdy = mBox.y - sBox.y;
+        float sdz = mBox.z - sBox.z;
+        float structDiff = sqrtf(sdx * sdx + sdy * sdy + sdz * sdz);
+
+        float exposureWeight = osv_smoothstep(0.20f, 0.05f, structDiff);
 
         float deltaX = fminf(fmaxf((colorMaster.x - colorSlave.x) * exposureWeight, -0.15f), 0.15f);
         float deltaY = fminf(fmaxf((colorMaster.y - colorSlave.y) * exposureWeight, -0.15f), 0.15f);
         float deltaZ = fminf(fmaxf((colorMaster.z - colorSlave.z) * exposureWeight, -0.15f), 0.15f);
 
+        float tWide = osv_smoothstep(-halfOverlap, halfOverlap, phiSeam);
         float balSlaveX = colorSlave.x + tWide * deltaX;
         float balSlaveY = colorSlave.y + tWide * deltaY;
         float balSlaveZ = colorSlave.z + tWide * deltaZ;
@@ -234,10 +277,11 @@ extern "C" __global__ void osv_stitch_kernel(cudaSurfaceObject_t outEquirect,
         float balMasterY = colorMaster.y - (1.0f - tWide) * deltaY;
         float balMasterZ = colorMaster.z - (1.0f - tWide) * deltaZ;
 
-        float mismatch = smoothstep(0.05f, 0.15f, colorDiff);
-        float minHalf = 0.25f * deg2rad;
-        float effectiveHalf = blendHalf + mismatch * (minHalf - blendHalf);
-        float adaptiveBlend = smoothstep(phiCut - effectiveHalf, phiCut + effectiveHalf, phiSeam);
+        float mismatch = osv_smoothstep(0.06f, 0.22f, structDiff);
+        float minHalf = 1.00f * deg2rad;
+        float maxHalf = 2.00f * deg2rad;
+        float effectiveHalf = maxHalf + mismatch * (minHalf - maxHalf);
+        float adaptiveBlend = osv_smoothstep(phiCut - effectiveHalf, phiCut + effectiveHalf, phiSeam);
 
         finalCol.x = balSlaveX + adaptiveBlend * (balMasterX - balSlaveX);
         finalCol.y = balSlaveY + adaptiveBlend * (balMasterY - balSlaveY);

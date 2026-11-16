@@ -662,16 +662,13 @@ static inline Vec3f quatRotate(const float q[4], const Vec3f& v) {
 }
 
 static inline float kannalaBrandtRd(float th, const float k[4]) {
-    const float th0 = 1.57079632679f;
-    if (th <= th0) {
-        float t2 = th * th, t4 = t2 * t2, t6 = t4 * t2, t8 = t4 * t4;
-        return th * (1.0f + k[0] * t2 + k[1] * t4 + k[2] * t6 + k[3] * t8);
-    } else {
-        float t2 = th0 * th0, t4 = t2 * t2, t6 = t4 * t2, t8 = t4 * t4;
-        float rd0 = th0 * (1.0f + k[0] * t2 + k[1] * t4 + k[2] * t6 + k[3] * t8);
-        float drd0 = 1.0f + 3.0f * k[0] * t2 + 5.0f * k[1] * t4 + 7.0f * k[2] * t6 + 9.0f * k[3] * t8;
-        return rd0 + drd0 * (th - th0);
-    }
+    // Factory calibrated Kannala-Brandt distortion model:
+    // Evaluate full 8th-order polynomial up to stationary peak (drd/dtheta = 0)
+    // Master: ~1.63587 rad (93.73 deg), Slave: ~1.70008 rad (97.41 deg)
+    float thPeak = (k[3] < -0.002f) ? 1.63587f : 1.70008f;
+    float safeTheta = std::min(th, thPeak);
+    float t2 = safeTheta * safeTheta, t4 = t2 * t2, t6 = t4 * t2, t8 = t4 * t4;
+    return safeTheta * (1.0f + k[0] * t2 + k[1] * t4 + k[2] * t6 + k[3] * t8);
 }
 
 static inline bool projectLens(const Vec3f& dLens, const LensCalibration& cal, uint32_t w, uint32_t h, float& px, float& py) {
@@ -717,8 +714,8 @@ void OsvVulkanStitcher::computeSeamLut(
     Vec3f vSeam = normVec(crossVec(nBisector, uSeam));
 
     const int N_KNOTS = 128;
-    const int N_CAND = 17;
-    const float maxSearch = 6.2f * (3.14159265f / 180.0f);
+    const int N_CAND = 21;
+    const float maxSearch = 6.0f * (3.14159265f / 180.0f);
     float costs[N_KNOTS][N_CAND];
     float lumaM[N_KNOTS][N_CAND];
     float lumaS[N_KNOTS][N_CAND];
@@ -739,8 +736,9 @@ void OsvVulkanStitcher::computeSeamLut(
                 Vec3f d_m = quatRotate(lens_master.quat, dTest);
                 Vec3f d_s = quatRotate(lens_slave.quat, dTest);
                 float px_m, py_m, px_s, py_s;
-                if (projectLens(d_m, lens_master, sensor_w, sensor_h, px_m, py_m) &&
-                    projectLens(d_s, lens_slave, sensor_w, sensor_h, px_s, py_s)) {
+                bool vM = projectLens(d_m, lens_master, sensor_w, sensor_h, px_m, py_m);
+                bool vS = projectLens(d_s, lens_slave, sensor_w, sensor_h, px_s, py_s);
+                if (vM && vS) {
                     float cM = sampleLuma(master_rgba, master_stride, px_m, py_m);
                     float cS = sampleLuma(slave_rgba, slave_stride, px_s, py_s);
                     diffAccum += std::abs(cM - cS);
@@ -749,7 +747,7 @@ void OsvVulkanStitcher::computeSeamLut(
                     validCount++;
                 }
             }
-            if (validCount > 2) {
+            if (validCount >= 3) {
                 diffs[k][c] = diffAccum / float(validCount);
                 lumaM[k][c] = mAccum / float(validCount);
                 lumaS[k][c] = sAccum / float(validCount);
@@ -796,11 +794,11 @@ void OsvVulkanStitcher::computeSeamLut(
             // Obstacle Repulsion:
             // When maxKnotDiff > 0.12f, a foreground obstacle is present at this knot.
             // Heavily penalize candidate angles where disparity is high, guiding the seam
-            // smoothly into regions of minimum optical difference without unilateral kinks.
+            // smoothly into regions of minimum optical difference.
             float obstacleCost = 0.0f;
             if (maxKnotDiff > 0.12f) {
                 float disparityRatio = avgDiff / maxKnotDiff;
-                obstacleCost = 0.35f * (disparityRatio * disparityRatio);
+                obstacleCost = 1.8f * (disparityRatio * disparityRatio);
             }
 
             float centerPref = 0.0005f * normPhi * normPhi;
@@ -814,7 +812,7 @@ void OsvVulkanStitcher::computeSeamLut(
     float M[N_KNOTS][N_CAND];
     int backtrack[N_KNOTS][N_CAND];
     for (int c = 0; c < N_CAND; ++c) M[0][c] = costs[0][c];
-    const float smooth_step_penalty = 0.035f;
+    const float smooth_step_penalty = 0.025f;
 
     for (int k = 1; k < N_KNOTS; ++k) {
         for (int c = 0; c < N_CAND; ++c) {
@@ -822,7 +820,7 @@ void OsvVulkanStitcher::computeSeamLut(
             int best_prev = c;
             for (int prev_c = 0; prev_c < N_CAND; ++prev_c) {
                 int dc = std::abs(c - prev_c);
-                if (dc > 2) continue; // enforce smooth C0 continuity across knots
+                if (dc > 3) continue; // enforce smooth C0 continuity across knots
                 float step_pen = smooth_step_penalty * float(dc);
                 float v = M[k - 1][prev_c] + step_pen;
                 if (v < best_val) {
@@ -845,10 +843,10 @@ void OsvVulkanStitcher::computeSeamLut(
     }
 
     // Pass 2: Cyclic-Constrained DP
-    // Initialize knot 0 anchored to best_end_c, and enforce circular wrap closure |c(N-1) - c(0)| <= 2
+    // Initialize knot 0 anchored to best_end_c, and enforce circular wrap closure |c(N-1) - c(0)| <= 3
     for (int c = 0; c < N_CAND; ++c) {
         int dc = std::abs(c - best_end_c);
-        if (dc <= 2) {
+        if (dc <= 3) {
             M[0][c] = costs[0][c] + smooth_step_penalty * float(dc);
         } else {
             M[0][c] = 1e9f;
@@ -861,7 +859,7 @@ void OsvVulkanStitcher::computeSeamLut(
             int best_prev = c;
             for (int prev_c = 0; prev_c < N_CAND; ++prev_c) {
                 int dc = std::abs(c - prev_c);
-                if (dc > 2) continue;
+                if (dc > 3) continue;
                 float step_pen = smooth_step_penalty * float(dc);
                 float v = M[k - 1][prev_c] + step_pen;
                 if (v < best_val) {
@@ -879,7 +877,7 @@ void OsvVulkanStitcher::computeSeamLut(
     float min_closed = 1e9f;
     for (int c = 0; c < N_CAND; ++c) {
         int dc = std::abs(c - best_end_c);
-        if (dc <= 2 && M[N_KNOTS - 1][c] < min_closed) {
+        if (dc <= 3 && M[N_KNOTS - 1][c] < min_closed) {
             min_closed = M[N_KNOTS - 1][c];
             final_c = c;
         }
@@ -900,9 +898,15 @@ void OsvVulkanStitcher::computeSeamLut(
 
     float smoothed_phis[N_KNOTS];
     for (int k = 0; k < N_KNOTS; ++k) {
-        int prev_k = (k - 1 + N_KNOTS) % N_KNOTS;
-        int next_k = (k + 1) % N_KNOTS;
-        smoothed_phis[k] = 0.25f * raw_phis[prev_k] + 0.50f * raw_phis[k] + 0.25f * raw_phis[next_k];
+        int km2 = (k - 2 + N_KNOTS) % N_KNOTS;
+        int km1 = (k - 1 + N_KNOTS) % N_KNOTS;
+        int kp1 = (k + 1) % N_KNOTS;
+        int kp2 = (k + 2) % N_KNOTS;
+        smoothed_phis[k] = (1.0f / 16.0f) * raw_phis[km2]
+                         + (4.0f / 16.0f) * raw_phis[km1]
+                         + (6.0f / 16.0f) * raw_phis[k]
+                         + (4.0f / 16.0f) * raw_phis[kp1]
+                         + (1.0f / 16.0f) * raw_phis[kp2];
     }
 
     // Resolve knots with temporal moving average to prevent video frame-to-frame seam jitter
