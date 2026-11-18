@@ -32,8 +32,10 @@ struct ProducerOsvContext
     mlt_producer producer_audio = nullptr;  // Stream 2: Audio
     mlt_producer producer_lrf = nullptr;    // Companion .LRF side-by-side dual-fisheye proxy
 
-    OsvMetadata metadata;
+    DualLensCalibration calibration;
+    std::unique_ptr<DualLensTelemetrySource> telemetry_source;
     std::unique_ptr<OsvVulkanStitcher> stitcher;
+    CompanionProxyResolver proxy_resolver = nullptr;
     bool stitcher_initialized = false;
     bool has_lrf = false;
     std::string lrf_path;
@@ -421,7 +423,7 @@ static int producer_get_image(mlt_frame frame,
 
     // Scaled frame index for gyro telemetry lookup matching container fps
     double profile_fps = mlt_producer_get_fps(producer);
-    double source_fps = ctx->metadata.fps > 0.0 ? ctx->metadata.fps : 25.0;
+    double source_fps = ctx->calibration.fps > 0.0 ? ctx->calibration.fps : 25.0;
     int64_t source_frame = (profile_fps > 0.0)
                                ? static_cast<int64_t>(position / profile_fps * source_fps + 0.5)
                                : position;
@@ -471,13 +473,15 @@ static int producer_get_image(mlt_frame frame,
                 ctx->stitcher->setStitchRadius((float) stitch_radius);
 
                 float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-                ctx->metadata.getStabilizationQuat(source_frame, stab_mode, gyro);
+                if (ctx->telemetry_source) {
+                    ctx->telemetry_source->getStabilizationQuat(source_frame, stab_mode, gyro);
+                }
                 bool ok
                     = ctx->stitcher->stitchSideBySide(lrf_img,
                                                       lw,
                                                       lh,
-                                                      ctx->metadata.lens_rear,  // Master (Stream 1)
-                                                      ctx->metadata.lens_front, // Slave (Stream 0)
+                                                      ctx->calibration.lens_master,
+                                                      ctx->calibration.lens_slave,
                                                       gyro,
                                                       out_w,
                                                       out_h,
@@ -582,13 +586,15 @@ static int producer_get_image(mlt_frame frame,
         ctx->stitcher->setStitchRadius((float) stitch_radius);
 
         float gyro[4] = {1.0f, 0.0f, 0.0f, 0.0f};
-        ctx->metadata.getStabilizationQuat(source_frame, stab_mode, gyro);
+        if (ctx->telemetry_source) {
+            ctx->telemetry_source->getStabilizationQuat(source_frame, stab_mode, gyro);
+        }
         if (ctx->stitcher->stitchFrames(img_master,
                                         img_slave,
                                         w1,
                                         h1,
-                                        ctx->metadata.lens_rear,  // Master (Lens 2)
-                                        ctx->metadata.lens_front, // Slave (Lens 1)
+                                        ctx->calibration.lens_master,
+                                        ctx->calibration.lens_slave,
                                         gyro,
                                         out_w,
                                         out_h,
@@ -787,6 +793,25 @@ static void producer_close(mlt_producer producer)
     }
 }
 
+static std::optional<CompanionProxyInfo> resolveDjiCompanionProxy(const std::string &source_path)
+{
+    size_t dot_pos = source_path.find_last_of('.');
+    if (dot_pos == std::string::npos) {
+        return std::nullopt;
+    }
+    std::string ext = source_path.substr(dot_pos);
+    std::string base = source_path.substr(0, dot_pos);
+    std::string cand1 = base + (ext == ".OSV" ? ".LRF" : ".lrf");
+    std::string cand2 = base + (ext == ".osv" ? ".lrf" : ".LRF");
+    if (std::filesystem::exists(cand1)) {
+        return CompanionProxyInfo{cand1, true};
+    }
+    if (std::filesystem::exists(cand2)) {
+        return CompanionProxyInfo{cand2, true};
+    }
+    return std::nullopt;
+}
+
 extern "C" mlt_producer producer_osv_init(mlt_profile profile,
                                           mlt_service_type type,
                                           const char *id,
@@ -797,6 +822,8 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile,
         return nullptr;
 
     ProducerOsvContext *ctx = new ProducerOsvContext();
+    ctx->telemetry_source = std::make_unique<OsvTelemetrySource>();
+    ctx->proxy_resolver = resolveDjiCompanionProxy;
     producer->child = ctx;
     producer->get_frame = producer_get_frame;
     producer->close = (mlt_destructor) producer_close;
@@ -814,18 +841,19 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile,
     ctx->profile = profile;
     ctx->osv_path = filename ? filename : "";
 
-    // Parse OSV metadata, frame rate, and per-frame attitude telemetry
-    if (filename && OsvMetadataParser::parseFromFile(filename, ctx->metadata)) {
-        mlt_properties_set(props, "meta.camera.model", ctx->metadata.camera_model.c_str());
-        mlt_properties_set(props, "meta.camera.serial", ctx->metadata.serial_number.c_str());
+    // Parse vendor-specific metadata, frame rate, and per-frame attitude telemetry
+    if (!ctx->osv_path.empty() && ctx->telemetry_source
+        && ctx->telemetry_source->parseFromFile(ctx->osv_path, ctx->calibration)) {
+        mlt_properties_set(props, "meta.camera.model", ctx->calibration.camera_model.c_str());
+        mlt_properties_set(props, "meta.camera.serial", ctx->calibration.serial_number.c_str());
         mlt_properties_set_int(props,
                                "meta.telemetry.samples",
-                               ctx->metadata.telemetry_frames.size());
+                               ctx->calibration.telemetry_sample_count);
     }
 
-    double fps = ctx->metadata.fps > 0.0 ? ctx->metadata.fps : 29.97002997002997;
-    int fps_num = ctx->metadata.fps_num > 0 ? ctx->metadata.fps_num : 30000;
-    int fps_den = ctx->metadata.fps_den > 0 ? ctx->metadata.fps_den : 1001;
+    double fps = ctx->calibration.fps > 0.0 ? ctx->calibration.fps : 29.97002997002997;
+    int fps_num = ctx->calibration.fps_num > 0 ? ctx->calibration.fps_num : 30000;
+    int fps_den = ctx->calibration.fps_den > 0 ? ctx->calibration.fps_den : 1001;
 
     // Critical seekability and stream properties for Shotcut UI & Filter dock
     mlt_properties_set_int(props, "seekable", 1);
@@ -890,21 +918,10 @@ extern "C" mlt_producer producer_osv_init(mlt_profile profile,
     // preview, and full dual-4K/5.7K HEVC compute stitching during render/export.
     // Can be forced via OSV_PREVIEW_MODE ("proxy" / "full" / "auto") or producer
     // property "osv.preview_mode".
-    if (filename) {
-        std::string path_str(filename);
-        size_t dot_pos = path_str.find_last_of('.');
-        if (dot_pos != std::string::npos) {
-            std::string ext = path_str.substr(dot_pos);
-            std::string base = path_str.substr(0, dot_pos);
-            std::string cand1 = base + (ext == ".OSV" ? ".LRF" : ".lrf");
-            std::string cand2 = base + (ext == ".osv" ? ".lrf" : ".LRF");
-            if (std::filesystem::exists(cand1)) {
-                ctx->lrf_path = cand1;
-                ctx->has_lrf = true;
-            } else if (std::filesystem::exists(cand2)) {
-                ctx->lrf_path = cand2;
-                ctx->has_lrf = true;
-            }
+    if (!ctx->osv_path.empty() && ctx->proxy_resolver) {
+        if (auto proxy = ctx->proxy_resolver(ctx->osv_path)) {
+            ctx->lrf_path = proxy->path;
+            ctx->has_lrf = true;
         }
     }
 

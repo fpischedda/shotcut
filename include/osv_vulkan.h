@@ -1,7 +1,7 @@
 #ifndef OSV_VULKAN_H
 #define OSV_VULKAN_H
 
-#include "osv_metadata.h"
+#include "dual_lens_types.h"
 #include <vulkan/vulkan.h>
 #include <vector>
 #include <string>
@@ -140,5 +140,7 @@ private:
     );
     void freeResources();
 };
+
+using DualLensVulkanStitcher = OsvVulkanStitcher;
 
 #endif // OSV_VULKAN_H

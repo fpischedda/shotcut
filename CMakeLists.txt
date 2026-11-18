@@ -45,20 +45,27 @@ add_custom_command(
 
 add_custom_target(compile_shaders ALL DEPENDS ${SHADER_SPV})
 
-# Core Library
-add_library(osv_core STATIC
-    src/osv_metadata.cpp
+# Common Two-Lens Vulkan Stitcher Library (vendor-agnostic)
+add_library(dual_lens_vulkan STATIC
     src/osv_vulkan.cpp
 )
-add_dependencies(osv_core compile_shaders)
+add_dependencies(dual_lens_vulkan compile_shaders)
 
-target_link_libraries(osv_core PUBLIC
+target_link_libraries(dual_lens_vulkan PUBLIC
     ${VULKAN_LIB}
-    PkgConfig::FFMPEG
 )
 if(OpenMP_CXX_FOUND)
-    target_link_libraries(osv_core PUBLIC OpenMP::OpenMP_CXX)
+    target_link_libraries(dual_lens_vulkan PUBLIC OpenMP::OpenMP_CXX)
 endif()
+
+# DJI OSV Demux & Telemetry Parser Library
+add_library(osv_metadata STATIC
+    src/osv_metadata.cpp
+)
+
+target_link_libraries(osv_metadata PUBLIC
+    PkgConfig::FFMPEG
+)
 
 # CLI Tool
 add_executable(osv_stitch
@@ -66,7 +73,8 @@ add_executable(osv_stitch
 )
 
 target_link_libraries(osv_stitch PRIVATE
-    osv_core
+    dual_lens_vulkan
+    osv_metadata
     ${VULKAN_LIB}
     PkgConfig::FFMPEG
 )
@@ -78,7 +86,8 @@ add_library(mltosv MODULE
 )
 
 target_link_libraries(mltosv PRIVATE
-    osv_core
+    dual_lens_vulkan
+    osv_metadata
     ${VULKAN_LIB}
     PkgConfig::FFMPEG
     PkgConfig::MLT
