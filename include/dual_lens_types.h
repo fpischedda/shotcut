@@ -4,8 +4,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <string>
+#include <vector>
 
 /**
  * @brief Intrinsics, Kannala-Brandt distortion coefficients, and relative
@@ -61,6 +63,14 @@ public:
 struct CompanionProxyInfo {
     std::string path;
     bool is_side_by_side = true;
+};
+
+struct DualLensFramePayload {
+    DualLensCalibration calibration;
+    float gyro_quat[4] = {1.0f, 0.0f, 0.0f, 0.0f};
+    std::shared_ptr<std::vector<uint8_t>> raw_sbs_rgba;
+    uint32_t raw_sbs_w = 0;
+    uint32_t raw_sbs_h = 0;
 };
 
 using CompanionProxyResolver =

@@ -30,9 +30,11 @@ include_directories(
     ${MLT_INCLUDE_DIRS}
 )
 
-# Custom command to compile GLSL compute shader to SPIR-V
+# Custom command to compile GLSL compute shaders to SPIR-V
 set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/osv_stitch.comp)
 set(SHADER_SPV ${CMAKE_CURRENT_SOURCE_DIR}/shaders/osv_stitch.spv)
+set(REFRAME_SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/direct_reframe.comp)
+set(REFRAME_SHADER_SPV ${CMAKE_CURRENT_SOURCE_DIR}/shaders/direct_reframe.spv)
 
 add_custom_command(
     OUTPUT ${SHADER_SPV}
@@ -43,7 +45,16 @@ add_custom_command(
     COMMENT "Compiling Vulkan compute shader osv_stitch.comp -> osv_stitch.spv"
 )
 
-add_custom_target(compile_shaders ALL DEPENDS ${SHADER_SPV})
+add_custom_command(
+    OUTPUT ${REFRAME_SHADER_SPV}
+    COMMAND glslc ${REFRAME_SHADER_SRC} -o ${REFRAME_SHADER_SPV}
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_CURRENT_BINARY_DIR}/shaders
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${REFRAME_SHADER_SPV} ${CMAKE_CURRENT_BINARY_DIR}/shaders/direct_reframe.spv
+    DEPENDS ${REFRAME_SHADER_SRC}
+    COMMENT "Compiling Vulkan compute shader direct_reframe.comp -> direct_reframe.spv"
+)
+
+add_custom_target(compile_shaders ALL DEPENDS ${SHADER_SPV} ${REFRAME_SHADER_SPV})
 
 # Common Two-Lens Vulkan Stitcher Library (vendor-agnostic)
 add_library(dual_lens_vulkan STATIC
@@ -79,10 +90,23 @@ target_link_libraries(osv_stitch PRIVATE
     PkgConfig::FFMPEG
 )
 
+# Direct Dual-Fisheye to Rectilinear CLI Prototype
+add_executable(osv_reframe
+    src/reframe_main.cpp
+)
+
+target_link_libraries(osv_reframe PRIVATE
+    dual_lens_vulkan
+    osv_metadata
+    ${VULKAN_LIB}
+    PkgConfig::FFMPEG
+)
+
 # MLT Service Plugin (libmltosv.so)
 add_library(mltosv MODULE
     mlt-plugin/mlt_osv.cpp
     mlt-plugin/producer_osv.cpp
+    mlt-plugin/filter_dual_lens_reframe.cpp
 )
 
 target_link_libraries(mltosv PRIVATE
