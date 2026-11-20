@@ -197,11 +197,21 @@ void main()
         return;
     }
 
-    // 5. Overlap band: evaluate both lenses and blend along the DP seam LUT
+    // 5. Overlap band: evaluate both lenses with 2D local flow symmetric warp + DP seam LUT
     vec3 uSeam = normalize(cross(aMaster, aSlave));
     vec3 vSeam = normalize(cross(nBisector, uSeam));
     float alpha = atan(dot(dBody, vSeam), dot(dBody, uSeam));
 
+    float normAlpha = (alpha + PI) / (2.0 * PI);
+    vec4 seamData = texture(seamLut, vec2(normAlpha, 0.5));
+    float phiCut = max(seamData.r, radians(-1.5));
+    // Clamp flow magnitude so warp Jacobian across [-halfOverlap, +halfOverlap] stays strictly > 0.75 (no smearing)
+    float maxFlow = radians(1.5);
+    float dPhi = clamp(seamData.g * seamData.a, -maxFlow, maxFlow);
+    float dAlpha = clamp(seamData.b * seamData.a, -maxFlow, maxFlow);
+
+    // Zero-warp path: preserve true Kannala-Brandt geometry (no bent rails/lines)
+    // and rely on the DP seam LUT + razor-thin transition to prevent ghosting.
     vec3 dBodyMaster = offsetToLens(dBody, aMaster, pc.stitchRadius);
     vec3 dBodySlave = offsetToLens(dBody, aSlave, pc.stitchRadius);
 
@@ -218,9 +228,14 @@ void main()
     vec2 rawUvSlave = projectKannalaBrandt(
         dSlave, pc.lens_slave_intrinsics, pc.lens_slave_dist, sensorSize, thSlave, rhoSlave);
 
-    bool validMaster = (thMaster <= maxTheta) && all(greaterThanEqual(rawUvMaster, vec2(0.0)))
+    // Enforce each lens's monotonic optical limit (avoid clamped/streaked outer rings)
+    float limitMaster = (pc.lens_master_dist.w < -0.002) ? 1.6057 : 1.6650; // 92.0 deg / 95.4 deg
+    float limitSlave  = (pc.lens_slave_dist.w < -0.002)  ? 1.6057 : 1.6650;
+    bool validMaster = (thMaster <= min(maxTheta, limitMaster))
+                       && all(greaterThanEqual(rawUvMaster, vec2(0.0)))
                        && all(lessThanEqual(rawUvMaster, vec2(1.0)));
-    bool validSlave = (thSlave <= maxTheta) && all(greaterThanEqual(rawUvSlave, vec2(0.0)))
+    bool validSlave = (thSlave <= min(maxTheta, limitSlave))
+                      && all(greaterThanEqual(rawUvSlave, vec2(0.0)))
                       && all(lessThanEqual(rawUvSlave, vec2(1.0)));
 
     vec2 uvMDx = projectBodyToLensUV(
@@ -237,9 +252,6 @@ void main()
         vec4 colorMaster = sampleLensEWA(lensMaster, rawUvMaster, uvMDx, uvMDy, sensorSize);
         vec4 colorSlave = sampleLensEWA(lensSlave, rawUvSlave, uvSDx, uvSDy, sensorSize);
 
-        float normAlpha = (alpha + PI) / (2.0 * PI);
-        float phiCut = texture(seamLut, vec2(normAlpha, 0.5)).r;
-
         vec2 texel = 3.0 / sensorSize;
         vec3 mBox = 0.25 * (
             texture(lensMaster, clamp(rawUvMaster + vec2(-texel.x, -texel.y), vec2(0.0), vec2(1.0))).rgb +
@@ -255,15 +267,17 @@ void main()
         );
         float structDiff = length(mBox - sBox);
 
-        float exposureWeight = smoothstep(0.20, 0.05, structDiff);
-        vec3 deltaC = clamp((colorMaster.rgb - colorSlave.rgb) * exposureWeight, vec3(-0.15), vec3(0.15));
+        // Keep low-frequency exposure equalization active even near foreground parallax
+        float exposureWeight = mix(1.0, 0.35, smoothstep(0.05, 0.25, structDiff));
+        vec3 deltaC = clamp((mBox - sBox) * exposureWeight, vec3(-0.15), vec3(0.15));
 
         float tWide = smoothstep(-halfOverlap, halfOverlap, phiSeam);
         vec3 balancedSlave = colorSlave.rgb + tWide * deltaC;
         vec3 balancedMaster = colorMaster.rgb - (1.0 - tWide) * deltaC;
 
-        float mismatch = smoothstep(0.06, 0.22, structDiff);
-        float effectiveHalf = mix(radians(2.00), radians(1.00), mismatch);
+        // Balanced seam transition (0.35 deg to 1.00 deg) to avoid hard knife-cuts while keeping ghosting minimal
+        float mismatch = smoothstep(0.03, 0.14, structDiff);
+        float effectiveHalf = mix(radians(1.00), radians(0.35), mismatch);
         float adaptiveBlend = smoothstep(phiCut - effectiveHalf, phiCut + effectiveHalf, phiSeam);
         finalColor = vec4(clamp(mix(balancedSlave, balancedMaster, adaptiveBlend), 0.0, 1.0), 1.0);
     } else if (validMaster) {

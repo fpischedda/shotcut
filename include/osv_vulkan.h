@@ -167,6 +167,9 @@ private:
     float stitchRadius_ = 2.2f;
     bool has_prev_seam_ = false;
     float prev_seam_phis_[128] = {0.0f};
+    float prev_seam_dphi_[128] = {0.0f};
+    float prev_seam_dalpha_[128] = {0.0f};
+    float prev_seam_conf_[128] = {0.0f};
 
     void computeSeamLut(
         const uint8_t* master_rgba,
@@ -177,7 +180,8 @@ private:
         uint32_t sensor_h,
         const LensCalibration& lens_master,
         const LensCalibration& lens_slave,
-        float* out_phis
+        float* out_phis,
+        float* out_rigid_omega = nullptr
     );
 
     bool initVulkanCore();

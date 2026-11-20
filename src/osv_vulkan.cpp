@@ -620,7 +620,7 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
               stageOutMem_,
               true,
               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-    createBuf(128 * sizeof(float),
+    createBuf(128 * 4 * sizeof(float),
               VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
               VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
               stageSeamLut_,
@@ -629,7 +629,7 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     vkMapMemory(device_, stageInMasterMem_, 0, inBytes, 0, &mappedInMaster_);
     vkMapMemory(device_, stageInSlaveMem_, 0, inBytes, 0, &mappedInSlave_);
     vkMapMemory(device_, stageOutMem_, 0, outBytes, 0, &mappedOut_);
-    vkMapMemory(device_, stageSeamLutMem_, 0, 128 * sizeof(float), 0, &mappedSeamLut_);
+    vkMapMemory(device_, stageSeamLutMem_, 0, 128 * 4 * sizeof(float), 0, &mappedSeamLut_);
 
     auto createImg =
         [&](uint32_t w, uint32_t h, VkImageUsageFlags usage, VkImage &img, VkDeviceMemory &mem, VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM) {
@@ -679,7 +679,7 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
               VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
               imgSeamLut_,
               memSeamLut_,
-              VK_FORMAT_R32_SFLOAT);
+              VK_FORMAT_R32G32B32A32_SFLOAT);
 
     auto createView = [&](VkImage img, VkImageView &view, VkFormat fmt = VK_FORMAT_R8G8B8A8_UNORM) {
         VkImageViewCreateInfo vInfo{};
@@ -696,7 +696,7 @@ bool OsvVulkanStitcher::ensureResources(uint32_t sensor_w,
     createView(imgMaster_, viewMaster_);
     createView(imgSlave_, viewSlave_);
     createView(imgOut_, viewOut_);
-    createView(imgSeamLut_, viewSeamLut_, VK_FORMAT_R32_SFLOAT);
+    createView(imgSeamLut_, viewSeamLut_, VK_FORMAT_R32G32B32A32_SFLOAT);
 
     VkSamplerCreateInfo sInfo{};
     sInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
@@ -848,7 +848,9 @@ static inline float kannalaBrandtRd(float th, const float k[4]) {
 static inline bool projectLens(const Vec3f& dLens, const LensCalibration& cal, uint32_t w, uint32_t h, float& px, float& py) {
     float rho = std::sqrt(dLens.x * dLens.x + dLens.y * dLens.y);
     float th = std::atan2(rho, dLens.z);
-    if (th > 1.70327f) return false; // 97.59 deg
+    // Stay strictly inside each lens's monotonic high-resolution zone (drd/dtheta >= 0.18)
+    float thLimit = (cal.k4 < -0.002f) ? 1.6057f : 1.6650f; // 92.0 deg (Master), 95.4 deg (Slave)
+    if (th > thLimit) return false;
     float rd = kannalaBrandtRd(th, &cal.k1);
     float safe_rho = std::max(rho, 1e-6f);
     float sx = (float)w / 3840.0f;
@@ -876,7 +878,8 @@ void OsvVulkanStitcher::computeSeamLut(
     uint32_t sensor_h,
     const LensCalibration& lens_master,
     const LensCalibration& lens_slave,
-    float* out_phis
+    float* out_phis,
+    float* out_rigid_omega
 ) {
     float q_m_inv[4] = {lens_master.quat[0], -lens_master.quat[1], -lens_master.quat[2], -lens_master.quat[3]};
     float q_s_inv[4] = {lens_slave.quat[0], -lens_slave.quat[1], -lens_slave.quat[2], -lens_slave.quat[3]};
@@ -1083,16 +1086,275 @@ void OsvVulkanStitcher::computeSeamLut(
                          + (1.0f / 16.0f) * raw_phis[kp2];
     }
 
-    // Resolve knots with temporal moving average to prevent video frame-to-frame seam jitter
-    for (int k = 0; k < N_KNOTS; ++k) {
-        if (has_prev_seam_) {
-            out_phis[k] = 0.65f * prev_seam_phis_[k] + 0.35f * smoothed_phis[k];
-        } else {
-            out_phis[k] = smoothed_phis[k];
+    // 2D local block-matching optical flow along the seam ring:
+    // Measures residual 2D angular offset (dPhi, dAlpha) between Master and Slave
+    // (covering both distant calibration offsets and near-field parallax) using
+    // zero-mean SAD over a 5x5 patch around (aK, phiCut) with coarse-to-fine search.
+    const float defaultR = (stitchRadius_ > 0.05f && stitchRadius_ < 100.0f) ? stitchRadius_ : 2.2f;
+    auto offsetRay = [](const Vec3f &dirBody, const Vec3f &axisLens, float radius) -> Vec3f {
+        if (radius > 0.05f && radius < 100.0f) {
+            return normVec(dirBody * radius - axisLens * (0.5f * 0.024f));
         }
-        prev_seam_phis_[k] = out_phis[k];
+        return dirBody;
+    };
+    auto dirFromSpherical = [&](float a, float phi) -> Vec3f {
+        Vec3f dSub = uSeam * std::cos(a) + vSeam * std::sin(a);
+        return normVec(dSub * std::cos(phi) + nBisector * std::sin(phi));
+    };
+
+    constexpr float kDeg2Rad = 3.141592653589793f / 180.0f;
+    const float patchStep = 0.35f * kDeg2Rad;
+    float raw_dphi[N_KNOTS];
+    float raw_dalpha[N_KNOTS];
+    float raw_conf[N_KNOTS];
+
+    #pragma omp parallel for schedule(static)
+    for (int k = 0; k < N_KNOTS; ++k) {
+        float aK = -3.141592653589793f + float(k) * (2.0f * 3.141592653589793f / float(N_KNOTS));
+        float phiK = smoothed_phis[k];
+
+        float patchM[25];
+        bool validM[25];
+        float sumM = 0.0f;
+        int cntM = 0;
+
+        for (int py = -2; py <= 2; ++py) {
+            for (int px = -2; px <= 2; ++px) {
+                int idx = (py + 2) * 5 + (px + 2);
+                Vec3f dBody = dirFromSpherical(aK + float(px) * patchStep, phiK + float(py) * patchStep);
+                Vec3f d_m = quatRotate(lens_master.quat, offsetRay(dBody, aMaster, defaultR));
+                float u, v;
+                if (projectLens(d_m, lens_master, sensor_w, sensor_h, u, v)) {
+                    float lum = sampleLuma(master_rgba, master_stride, u, v);
+                    patchM[idx] = lum;
+                    validM[idx] = true;
+                    sumM += lum;
+                    cntM++;
+                } else {
+                    patchM[idx] = 0.0f;
+                    validM[idx] = false;
+                }
+            }
+        }
+
+        if (cntM < 16) {
+            raw_dphi[k] = 0.0f;
+            raw_dalpha[k] = 0.0f;
+            raw_conf[k] = 0.0f;
+            continue;
+        }
+
+        float meanM = sumM / float(cntM);
+        float varM = 0.0f;
+        for (int i = 0; i < 25; ++i) {
+            if (validM[i]) {
+                float d = patchM[i] - meanM;
+                varM += d * d;
+            }
+        }
+        varM /= float(cntM);
+        if (varM < 1.5e-4f) {
+            raw_dphi[k] = 0.0f;
+            raw_dalpha[k] = 0.0f;
+            raw_conf[k] = 0.0f;
+            continue;
+        }
+
+        auto evalSad = [&](float sPhi, float sAlpha, float &outSad) -> bool {
+            float patchS[25];
+            bool validS[25];
+            float sumS = 0.0f;
+            int cntBoth = 0;
+            for (int py = -2; py <= 2; ++py) {
+                for (int px = -2; px <= 2; ++px) {
+                    int idx = (py + 2) * 5 + (px + 2);
+                    if (!validM[idx]) {
+                        validS[idx] = false;
+                        continue;
+                    }
+                    Vec3f dBody = dirFromSpherical(aK + float(px) * patchStep + sAlpha,
+                                                   phiK + float(py) * patchStep + sPhi);
+                    Vec3f d_s = quatRotate(lens_slave.quat, offsetRay(dBody, aSlave, defaultR));
+                    float u, v;
+                    if (projectLens(d_s, lens_slave, sensor_w, sensor_h, u, v)) {
+                        float lum = sampleLuma(slave_rgba, slave_stride, u, v);
+                        patchS[idx] = lum;
+                        validS[idx] = true;
+                        sumS += lum;
+                        cntBoth++;
+                    } else {
+                        validS[idx] = false;
+                    }
+                }
+            }
+            if (cntBoth < 16)
+                return false;
+
+            float meanS = sumS / float(cntBoth);
+            float sad = 0.0f;
+            for (int i = 0; i < 25; ++i) {
+                if (validM[i] && validS[i]) {
+                    sad += std::abs((patchM[i] - meanM) - (patchS[i] - meanS));
+                }
+            }
+            outSad = sad / float(cntBoth);
+            return true;
+        };
+
+        float bestScore = 1e9f;
+        float bestSad = 1.0f;
+        float bestPhi = 0.0f;
+        float bestAlpha = 0.0f;
+
+        // Coarse 15x15 search: [-3.5 deg, +3.5 deg] step 0.5 deg
+        const float coarseStep = 0.5f * kDeg2Rad;
+        for (int iy = -7; iy <= 7; ++iy) {
+            float sPhi = float(iy) * coarseStep;
+            for (int ix = -7; ix <= 7; ++ix) {
+                float sAlpha = float(ix) * coarseStep;
+                float sad = 1.0f;
+                if (evalSad(sPhi, sAlpha, sad)) {
+                    float reg = 0.0002f * ((sPhi * sPhi + sAlpha * sAlpha) / (kDeg2Rad * kDeg2Rad));
+                    float score = sad + reg;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestSad = sad;
+                        bestPhi = sPhi;
+                        bestAlpha = sAlpha;
+                    }
+                }
+            }
+        }
+
+        // Fine 3x3 refinement: step 0.16 deg
+        const float fineStep = 0.16f * kDeg2Rad;
+        float cPhi = bestPhi, cAlpha = bestAlpha;
+        for (int iy = -1; iy <= 1; ++iy) {
+            for (int ix = -1; ix <= 1; ++ix) {
+                if (iy == 0 && ix == 0) continue;
+                float sPhi = cPhi + float(iy) * fineStep;
+                float sAlpha = cAlpha + float(ix) * fineStep;
+                float sad = 1.0f;
+                if (evalSad(sPhi, sAlpha, sad)) {
+                    float reg = 0.0002f * ((sPhi * sPhi + sAlpha * sAlpha) / (kDeg2Rad * kDeg2Rad));
+                    float score = sad + reg;
+                    if (score < bestScore) {
+                        bestScore = score;
+                        bestSad = sad;
+                        bestPhi = sPhi;
+                        bestAlpha = sAlpha;
+                    }
+                }
+            }
+        }
+
+        float texWeight = std::clamp((varM - 1.5e-4f) / 1.0e-3f, 0.0f, 1.0f);
+        float matchWeight = std::clamp(1.0f - bestSad / 0.07f, 0.0f, 1.0f);
+        raw_dphi[k] = bestPhi;
+        raw_dalpha[k] = bestAlpha;
+        raw_conf[k] = texWeight * matchWeight;
+    }
+
+    // Confidence-weighted circular 5-tap smoothing so low-texture knots inherit neighbor flow
+    float smoothed_dphi[N_KNOTS];
+    float smoothed_dalpha[N_KNOTS];
+    float smoothed_conf[N_KNOTS];
+    const float kGauss[5] = {1.0f, 4.0f, 6.0f, 4.0f, 1.0f};
+    for (int k = 0; k < N_KNOTS; ++k) {
+        float wPhi = 0.0f, wAlpha = 0.0f, wSum = 0.0f, cSum = 0.0f;
+        for (int o = -2; o <= 2; ++o) {
+            int idx = (k + o + N_KNOTS) % N_KNOTS;
+            float g = kGauss[o + 2];
+            float cw = g * (raw_conf[idx] + 0.02f);
+            wPhi += cw * raw_dphi[idx];
+            wAlpha += cw * raw_dalpha[idx];
+            wSum += cw;
+            cSum += g * raw_conf[idx];
+        }
+        smoothed_dphi[k] = wPhi / wSum;
+        smoothed_dalpha[k] = wAlpha / wSum;
+        smoothed_conf[k] = std::clamp(cSum / 16.0f, 0.0f, 1.0f);
+    }
+
+    // Resolve knots with temporal moving average to prevent video frame-to-frame jitter
+    for (int k = 0; k < N_KNOTS; ++k) {
+        float phiOut = smoothed_phis[k];
+        float dPhiOut = smoothed_dphi[k];
+        float dAlphaOut = smoothed_dalpha[k];
+        float confOut = smoothed_conf[k];
+        if (has_prev_seam_) {
+            phiOut = 0.65f * prev_seam_phis_[k] + 0.35f * smoothed_phis[k];
+            dPhiOut = 0.65f * prev_seam_dphi_[k] + 0.35f * smoothed_dphi[k];
+            dAlphaOut = 0.65f * prev_seam_dalpha_[k] + 0.35f * smoothed_dalpha[k];
+            confOut = 0.65f * prev_seam_conf_[k] + 0.35f * smoothed_conf[k];
+        }
+        prev_seam_phis_[k] = phiOut;
+        prev_seam_dphi_[k] = dPhiOut;
+        prev_seam_dalpha_[k] = dAlphaOut;
+        prev_seam_conf_[k] = confOut;
+        out_phis[4 * k + 0] = phiOut;
+        out_phis[4 * k + 1] = dPhiOut;
+        out_phis[4 * k + 2] = dAlphaOut;
+        out_phis[4 * k + 3] = confOut;
     }
     has_prev_seam_ = true;
+
+    if (out_rigid_omega) {
+        // Fit a single global rigid 3D rotation omega = (wx, wy, wz) across all
+        // high-confidence seam knots:
+        //   (-t_k) . omega = dPhi_k
+        //   nBisector . omega = dAlpha_k
+        double ATA[3][3] = {{1e-4, 0.0, 0.0}, {0.0, 1e-4, 0.0}, {0.0, 0.0, 1e-4}};
+        double ATb[3] = {0.0, 0.0, 0.0};
+        for (int k = 0; k < N_KNOTS; ++k) {
+            double w = static_cast<double>(out_phis[4 * k + 3]);
+            if (w < 0.05) continue;
+            float aK = -3.141592653589793f + float(k) * (2.0f * 3.141592653589793f / float(N_KNOTS));
+            Vec3f tK = normVec(uSeam * (-std::sin(aK)) + vSeam * std::cos(aK));
+            double r1[3] = {-tK.x, -tK.y, -tK.z};
+            double b1 = static_cast<double>(out_phis[4 * k + 1]);
+            double r2[3] = {nBisector.x, nBisector.y, nBisector.z};
+            double b2 = static_cast<double>(out_phis[4 * k + 2]);
+            for (int i = 0; i < 3; ++i) {
+                ATb[i] += w * (r1[i] * b1 + r2[i] * b2);
+                for (int j = 0; j < 3; ++j) {
+                    ATA[i][j] += w * (r1[i] * r1[j] + r2[i] * r2[j]);
+                }
+            }
+        }
+        // 3x3 Gaussian elimination with partial pivoting
+        double M[3][4];
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < 3; ++j) M[i][j] = ATA[i][j];
+            M[i][3] = ATb[i];
+        }
+        for (int col = 0; col < 3; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < 3; ++r) {
+                if (std::abs(M[r][col]) > std::abs(M[piv][col])) piv = r;
+            }
+            if (piv != col) {
+                for (int j = col; j < 4; ++j) std::swap(M[col][j], M[piv][j]);
+            }
+            if (std::abs(M[col][col]) < 1e-9) continue;
+            for (int r = col + 1; r < 3; ++r) {
+                double f = M[r][col] / M[col][col];
+                for (int j = col; j < 4; ++j) M[r][j] -= f * M[col][j];
+            }
+        }
+        double x[3] = {0.0, 0.0, 0.0};
+        for (int i = 2; i >= 0; --i) {
+            if (std::abs(M[i][i]) < 1e-9) continue;
+            double s = M[i][3];
+            for (int j = i + 1; j < 3; ++j) s -= M[i][j] * x[j];
+            x[i] = s / M[i][i];
+        }
+        // Clamp rigid correction to +-2.5 deg per axis for safety
+        const double maxOmega = 2.5 * 3.141592653589793 / 180.0;
+        for (int i = 0; i < 3; ++i) {
+            out_rigid_omega[i] = static_cast<float>(std::clamp(x[i], -maxOmega, maxOmega));
+        }
+    }
 }
 
 bool OsvVulkanStitcher::stitchFrames(const uint8_t *master_rgba,
